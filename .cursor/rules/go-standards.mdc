@@ -1,0 +1,7 @@
+---
+description: 编辑 Go 文件时自动加载 Go 编码规范
+globs: "**/*.go"
+alwaysApply: false
+---
+Go 编码规范（基于 Google Golang 规范）。
+详细规范请读取 .codebuddy/skills/std-company-go/SKILL.md 及其 reference/ 目录。

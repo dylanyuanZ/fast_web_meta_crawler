@@ -1,0 +1,6 @@
+---
+description: (Disabled) C++ standards - not applicable to this Go project
+globs: "**/*.cc,**/*.cpp,**/*.h,**/*.hpp"
+alwaysApply: false
+---
+This rule is disabled. This project uses Go, not C++.
