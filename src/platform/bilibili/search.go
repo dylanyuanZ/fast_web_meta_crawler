@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -52,7 +53,7 @@ func (c *BiliBrowserSearchCrawler) SearchPage(ctx context.Context, keyword strin
 	p := c.manager.GetPage()
 	defer c.manager.PutPage(p)
 
-	targetURL := fmt.Sprintf("https://search.bilibili.com/video?keyword=%s&page=%d", keyword, page)
+	targetURL := fmt.Sprintf("https://search.bilibili.com/video?keyword=%s&page=%d", url.QueryEscape(keyword), page)
 
 	// Extract SSR data from Pinia state.
 	rawJSON, err := browser.NavigateAndExtract(ctx, p, targetURL, ssrExtractJS)

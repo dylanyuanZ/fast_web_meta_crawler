@@ -338,3 +338,243 @@ func TestVerifyPagination(t *testing.T) {
 	}
 	t.Logf("All %d videos have unique BvIDs ✓", len(videos))
 }
+
+// TestProbeSearchHashKeyword probes the difference between searching with "#keyword"
+// vs "keyword" on Bilibili. The "#" character has special meaning in URLs (fragment identifier),
+// and may also have special meaning on Bilibili (tag search vs keyword search).
+//
+// This probe tests 3 variants:
+//  1. "宠物"       — plain keyword search
+//  2. "#宠物"      — with literal "#" in URL (browser may treat as fragment)
+//  3. "%23宠物"    — with URL-encoded "#" (%23)
+//
+// Run with: go test -v -run TestProbeSearchHashKeyword -timeout 120s ./src/platform/bilibili/
+func TestProbeSearchHashKeyword(t *testing.T) {
+	// Load config for browser settings and cookie.
+	if err := config.Load("../../../conf/config.yaml"); err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	cfg := config.Get()
+
+	browser.InitDebugLog("../../../log")
+	defer browser.CloseDebugLog()
+
+	mgr, err := browser.New(browser.Config{
+		Headless:    cfg.Browser.IsHeadless(),
+		UserDataDir: cfg.Browser.UserDataDir,
+		Concurrency: 1,
+		BrowserBin:  cfg.Browser.Bin,
+	})
+	if err != nil {
+		t.Fatalf("create browser: %v", err)
+	}
+	defer mgr.Close()
+
+	page := mgr.GetPage()
+	defer mgr.PutPage(page)
+
+	if cfg.Cookie != "" {
+		if err := browser.InjectCookie(page, ".bilibili.com", cfg.Cookie); err != nil {
+			t.Logf("WARN: inject cookie: %v", err)
+		} else {
+			t.Log("Cookie injected successfully")
+		}
+	}
+
+	// Define the 3 search URL variants to probe.
+	variants := []struct {
+		name string
+		url  string
+	}{
+		{
+			name: "plain_keyword",
+			url:  "https://search.bilibili.com/video?keyword=宠物&page=1",
+		},
+		{
+			name: "hash_literal",
+			url:  "https://search.bilibili.com/video?keyword=#宠物&page=1",
+		},
+		{
+			name: "hash_encoded",
+			url:  "https://search.bilibili.com/video?keyword=%23宠物&page=1",
+		},
+	}
+
+	// JS expression to extract Pinia search data + the actual URL the browser navigated to.
+	probeJS := `() => {
+		const result = {
+			actualURL: window.location.href,
+			actualSearch: window.location.search,
+			actualHash: window.location.hash,
+		};
+
+		const pinia = window.__pinia;
+		if (!pinia) {
+			result.piniaExists = false;
+			return JSON.stringify(result);
+		}
+		result.piniaExists = true;
+		result.piniaKeys = Object.keys(pinia);
+
+		const str = pinia.searchTypeResponse && pinia.searchTypeResponse.searchTypeResponse;
+		if (str) {
+			try {
+				const data = JSON.parse(JSON.stringify(str));
+				result.numPages = data.numPages || 0;
+				result.numResults = data.numResults || 0;
+				result.resultCount = (data.result && data.result.length) || 0;
+				// Include first 3 result titles for comparison.
+				if (data.result && data.result.length > 0) {
+					result.sampleTitles = data.result.slice(0, 3).map(r => r.title);
+				}
+			} catch(e) {
+				result.parseError = e.message;
+			}
+		} else {
+			result.searchTypeResponse = null;
+			// Dump all pinia keys for debugging.
+			result.piniaDebug = {};
+			for (const key of Object.keys(pinia)) {
+				try {
+					result.piniaDebug[key] = Object.keys(pinia[key]);
+				} catch(e) {}
+			}
+		}
+
+		return JSON.stringify(result);
+	}`
+
+	for _, v := range variants {
+		t.Logf("\n========== Probing: %s ==========", v.name)
+		t.Logf("URL: %s", v.url)
+
+		_, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+		if err := page.Navigate(v.url); err != nil {
+			t.Errorf("[%s] navigate error: %v", v.name, err)
+			cancel()
+			continue
+		}
+		if err := page.WaitLoad(); err != nil {
+			t.Logf("[%s] WARN: wait load: %v", v.name, err)
+		}
+
+		// Small delay to ensure Pinia state is populated.
+		time.Sleep(2 * time.Second)
+
+		result, err := page.Eval(probeJS)
+		if err != nil {
+			t.Errorf("[%s] eval error: %v", v.name, err)
+			cancel()
+			continue
+		}
+
+		raw := result.Value.Str()
+		t.Logf("[%s] Raw result (%d bytes): %s", v.name, len(raw), raw)
+
+		// Parse and pretty-print the result.
+		var parsed map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
+			pretty, _ := json.MarshalIndent(parsed, "  ", "  ")
+			t.Logf("[%s] Parsed result:\n  %s", v.name, string(pretty))
+		}
+
+		cancel()
+
+		// Brief pause between requests to avoid rate limiting.
+		time.Sleep(3 * time.Second)
+	}
+
+	t.Log("\n========== Probe Complete ==========")
+	t.Log("Compare the results above to understand the difference between # and non-# keywords.")
+}
+
+// TestProbeSearchSpecialChars verifies that SearchPage correctly handles keywords
+// containing URL-special characters (#, &, +, %, space, etc.) after the url.QueryEscape fix.
+// This test uses the actual SearchPage method (not raw URL navigation) to confirm
+// the fix works end-to-end.
+//
+// Run with: go test -v -run TestProbeSearchSpecialChars -timeout 180s ./src/platform/bilibili/
+func TestProbeSearchSpecialChars(t *testing.T) {
+	if err := config.Load("../../../conf/config.yaml"); err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	cfg := config.Get()
+
+	browser.InitDebugLog("../../../log")
+	defer browser.CloseDebugLog()
+
+	mgr, err := browser.New(browser.Config{
+		Headless:    cfg.Browser.IsHeadless(),
+		UserDataDir: cfg.Browser.UserDataDir,
+		Concurrency: 1,
+		BrowserBin:  cfg.Browser.Bin,
+	})
+	if err != nil {
+		t.Fatalf("create browser: %v", err)
+	}
+	defer mgr.Close()
+
+	// Ensure login for search.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	if err := browser.EnsureLogin(ctx, mgr, "https://www.bilibili.com", cfg.Cookie, BilibiliLoginChecker); err != nil {
+		t.Fatalf("ensure login: %v", err)
+	}
+
+	sc := NewSearchCrawler(mgr)
+
+	// Test keywords with various special characters.
+	// Each entry: keyword, description, whether we expect results (true = should have results).
+	testCases := []struct {
+		keyword     string
+		description string
+		expectData  bool
+	}{
+		{"#宠物", "hash prefix (tag-style keyword)", true},
+		{"猫&狗", "ampersand in keyword", true},
+		{"C++编程", "plus signs in keyword", true},
+		{"100%好评", "percent sign in keyword", true},
+		{"宠物 猫", "space in keyword", true},
+		{"什么?", "question mark in keyword", true},
+	}
+
+	for _, tc := range testCases {
+		t.Logf("\n========== Testing keyword: %q (%s) ==========", tc.keyword, tc.description)
+
+		videos, pageInfo, err := sc.SearchPage(ctx, tc.keyword, 1)
+		if err != nil {
+			if tc.expectData {
+				t.Errorf("[%s] keyword=%q: unexpected error: %v", tc.description, tc.keyword, err)
+			} else {
+				t.Logf("[%s] keyword=%q: expected error: %v", tc.description, tc.keyword, err)
+			}
+			// Pause between requests to avoid rate limiting.
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		t.Logf("[%s] keyword=%q: videos=%d, totalPages=%d, totalCount=%d",
+			tc.description, tc.keyword, len(videos), pageInfo.TotalPages, pageInfo.TotalCount)
+
+		if tc.expectData && len(videos) == 0 {
+			t.Errorf("[%s] keyword=%q: expected results but got 0 videos", tc.description, tc.keyword)
+		}
+
+		if len(videos) > 0 {
+			// Show first 2 titles for verification.
+			for i, v := range videos {
+				if i >= 2 {
+					break
+				}
+				t.Logf("  [%d] %s (author=%s, play=%d)", i, v.Title, v.Author, v.PlayCount)
+			}
+		}
+
+		// Pause between requests to avoid rate limiting.
+		time.Sleep(3 * time.Second)
+	}
+
+	t.Log("\n========== Special Character Probe Complete ==========")
+}
