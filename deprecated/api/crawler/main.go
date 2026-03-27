@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dylanyuanZ/fast_web_meta_crawler/deprecated/api/httpclient"
 	src "github.com/dylanyuanZ/fast_web_meta_crawler/src"
-	"github.com/dylanyuanZ/fast_web_meta_crawler/src/browser"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/config"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/export"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/platform/bilibili"
@@ -62,33 +62,11 @@ func main() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	// Initialize browser Manager.
-	mgr, err := browser.New(browser.Config{
-		Headless:    cfg.Browser.IsHeadless(),
-		UserDataDir: cfg.Browser.UserDataDir,
-		Concurrency: cfg.Concurrency,
-	})
-	if err != nil {
-		log.Fatalf("FATAL: failed to create browser manager: %v", err)
-	}
-	defer mgr.Close()
-
-	// Handle signals — close browser on shutdown.
 	go func() {
 		sig := <-sigCh
 		log.Printf("WARN: Received signal %v, shutting down gracefully...", sig)
-		mgr.Close()
 		cancel()
 	}()
-
-	// Ensure login state.
-	loginCtx, loginCancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer loginCancel()
-
-	if err := browser.EnsureLogin(loginCtx, mgr, "https://www.bilibili.com", cfg.Cookie, bilibili.BilibiliLoginChecker); err != nil {
-		log.Fatalf("FATAL: failed to ensure login: %v", err)
-	}
 
 	// Check for existing progress file.
 	prog := progress.Load(cfg.OutputDir, *platform, *keyword)
@@ -110,8 +88,9 @@ func main() {
 	}
 
 	// Create platform-specific crawlers.
-	searchCrawler := bilibili.NewSearchCrawler(mgr)
-	authorCrawler := bilibili.NewAuthorCrawler(mgr)
+	client := httpclient.New()
+	searchCrawler := bilibili.NewSearchCrawler(client)
+	authorCrawler := bilibili.NewAuthorCrawler(client)
 
 	taskStart := time.Now()
 	var mids []src.AuthorMid

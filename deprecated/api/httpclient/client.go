@@ -31,16 +31,17 @@ const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 func New() *Client {
 	cfg := config.Get()
 
+	// HTTP sub-config was removed from Config; use hardcoded defaults for deprecated code.
 	httpClient := &http.Client{
-		Timeout: cfg.HTTP.Timeout,
+		Timeout: 30 * time.Second,
 	}
 
 	c := &Client{
 		inner:         httpClient,
-		maxRetries:    cfg.HTTP.MaxRetries,
-		initialDelay:  cfg.HTTP.InitialDelay,
-		maxDelay:      cfg.HTTP.MaxDelay,
-		backoffFactor: cfg.HTTP.BackoffFactor,
+		maxRetries:    3,
+		initialDelay:  1 * time.Second,
+		maxDelay:      30 * time.Second,
+		backoffFactor: 2.0,
 		cookie:        cfg.Cookie,
 	}
 

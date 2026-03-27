@@ -3,16 +3,13 @@ max_search_page: 50          # max pages to search (1-50)
 max_video_per_author: 1000   # max videos to collect per author
 
 # Concurrency configuration
-concurrency: 1               # Worker Pool concurrency level (1 = safest for anti-crawl)
-request_interval: 2500ms     # Delay between requests per worker (anti-crawl)
+concurrency: 3               # Worker Pool concurrency level (= browser Tab count, recommended 3-5)
+request_interval: 500ms      # Delay between requests per worker (browser mode needs less delay)
 
-# HTTP client configuration
-http:
-  timeout: 15s               # single request timeout
-  max_retries: 3             # max retry attempts
-  initial_delay: 2s          # first retry delay
-  max_delay: 15s             # max retry delay cap
-  backoff_factor: 2.0        # backoff multiplier per retry
+# Browser configuration
+browser:
+  headless: true                       # headless mode (server must be true, set false for local GUI login)
+  user_data_dir: "data/browser-profile/" # browser profile directory for login state persistence
 
 # Circuit breaker configuration
 max_consecutive_failures: 10 # consecutive failures before aborting
@@ -20,6 +17,6 @@ max_consecutive_failures: 10 # consecutive failures before aborting
 # Output configuration
 output_dir: "data/"          # CSV output directory
 
-# Cookie configuration (paste your browser cookie here for authenticated access)
+# Cookie configuration (headless mode fallback when user_data_dir has no login state)
 # How to get cookie: open bilibili.com in browser → F12 → Network → copy Cookie header value
 cookie: ""

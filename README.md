@@ -45,13 +45,13 @@ cd fast_web_meta_crawler
 go mod tidy
 
 # Build the binary
-go build -o build/crawler ./cmd/crawler
+go build -o bin/crawler ./cmd/crawler
 ```
 
 ## Usage
 
 ```bash
-./build/crawler --platform <platform> --keyword <keyword> [--stage 0|1|all] [--config path]
+./bin/crawler --platform <platform> --keyword <keyword> [--stage 0|1|all] [--config path]
 ```
 
 ### Parameters
@@ -67,16 +67,16 @@ go build -o build/crawler ./cmd/crawler
 
 ```bash
 # Run full pipeline: search + author details
-./build/crawler --platform bilibili --keyword "美妆测评"
+./bin/crawler --platform bilibili --keyword "美妆测评"
 
 # Run only Stage 0 (video search)
-./build/crawler --platform bilibili --keyword "科技数码" --stage 0
+./bin/crawler --platform bilibili --keyword "科技数码" --stage 0
 
 # Run only Stage 1 (author details) using previously saved intermediate data
-./build/crawler --platform bilibili --keyword "科技数码" --stage 1
+./bin/crawler --platform bilibili --keyword "科技数码" --stage 1
 
 # Use a custom config file
-./build/crawler --platform bilibili --keyword "游戏" --config my_config.yaml
+./bin/crawler --platform bilibili --keyword "游戏" --config my_config.yaml
 ```
 
 ### Output
@@ -85,6 +85,21 @@ CSV files are saved to the directory specified by `output_dir` in the config (de
 
 - `bilibili_<keyword>_<date>_<time>_video.csv` — Video search results
 - `bilibili_<keyword>_<date>_<time>_author.csv` — Author profile details
+
+## Testing
+
+Tests are located in `src/test/` and cover configuration loading, Bilibili search & author API parsing, cookie handling, and request interceptors.
+
+```bash
+# Run all tests
+go test ./src/test/... -v
+
+# Run a specific test file
+go test ./src/test/ -run TestConfigLoad -v
+
+# Run tests with short output (no verbose)
+go test ./src/test/...
+```
 
 ## Configuration
 

@@ -4,55 +4,69 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
-	"regexp"
+	"log"
 	"strconv"
-	"strings"
 	"time"
 
 	src "github.com/dylanyuanZ/fast_web_meta_crawler/src"
-	"github.com/dylanyuanZ/fast_web_meta_crawler/src/httpclient"
+	"github.com/dylanyuanZ/fast_web_meta_crawler/src/browser"
 )
 
-const (
-	searchAPI = "https://api.bilibili.com/x/web-interface/search/type"
-)
-
-// BiliSearchCrawler implements src.SearchCrawler for Bilibili.
-type BiliSearchCrawler struct {
-	client *httpclient.Client
+// BiliBrowserSearchCrawler implements src.SearchCrawler using browser automation.
+type BiliBrowserSearchCrawler struct {
+	manager *browser.Manager
 }
 
 // Compile-time interface check.
-var _ src.SearchCrawler = (*BiliSearchCrawler)(nil)
+var _ src.SearchCrawler = (*BiliBrowserSearchCrawler)(nil)
 
-// NewSearchCrawler creates a new BiliSearchCrawler.
-func NewSearchCrawler(client *httpclient.Client) *BiliSearchCrawler {
-	return &BiliSearchCrawler{client: client}
+// NewSearchCrawler creates a new BiliBrowserSearchCrawler.
+func NewSearchCrawler(manager *browser.Manager) *BiliBrowserSearchCrawler {
+	return &BiliBrowserSearchCrawler{manager: manager}
 }
 
-// SearchPage fetches a single page of Bilibili search results.
-// Automatically retries on transient API errors (-799, -352).
-func (c *BiliSearchCrawler) SearchPage(ctx context.Context, keyword string, page int) ([]src.Video, src.PageInfo, error) {
-	var resp SearchResp
-	err := retryOnAPIError(ctx, fmt.Sprintf("search page %d", page), func() error {
-		url := fmt.Sprintf("%s?search_type=video&keyword=%s&page=%d", searchAPI, keyword, page)
-		body, err := c.client.Get(ctx, url)
-		if err != nil {
-			return fmt.Errorf("search page %d: %w", page, err)
-		}
-		if err := json.Unmarshal(body, &resp); err != nil {
-			return fmt.Errorf("parse search response: %w", err)
-		}
-		if resp.Code != 0 {
-			return &apiError{Code: resp.Code, Message: resp.Message, Context: fmt.Sprintf("search page %d", page)}
-		}
-		return nil
-	})
+// SearchPage opens Bilibili search page and intercepts the search API response.
+// URL: https://search.bilibili.com/video?keyword={keyword}&page={page}
+// Intercepts: api.bilibili.com/x/web-interface/search/type
+func (c *BiliBrowserSearchCrawler) SearchPage(ctx context.Context, keyword string, page int) ([]src.Video, src.PageInfo, error) {
+	p := c.manager.GetPage()
+	defer c.manager.PutPage(p)
+
+	targetURL := fmt.Sprintf("https://search.bilibili.com/video?keyword=%s&page=%d", keyword, page)
+
+	rules := []browser.InterceptRule{{
+		URLPattern: "/x/web-interface/search/type",
+		ID:         "search",
+	}}
+
+	results, err := browser.NavigateAndIntercept(ctx, p, targetURL, rules)
 	if err != nil {
-		return nil, src.PageInfo{}, err
+		return nil, src.PageInfo{}, fmt.Errorf("search page %d: %w", page, err)
 	}
 
+	// Find the search result.
+	var searchBody []byte
+	for _, r := range results {
+		if r.ID == "search" {
+			searchBody = r.Body
+			break
+		}
+	}
+	if searchBody == nil {
+		return nil, src.PageInfo{}, fmt.Errorf("search page %d: no search API response intercepted", page)
+	}
+
+	// Parse JSON response.
+	var resp SearchResp
+	if err := json.Unmarshal(searchBody, &resp); err != nil {
+		return nil, src.PageInfo{}, fmt.Errorf("parse search response: %w", err)
+	}
+
+	if resp.Code != 0 {
+		return nil, src.PageInfo{}, fmt.Errorf("search API error (code=%d, message=%s)", resp.Code, resp.Message)
+	}
+
+	// Convert to common types.
 	videos := make([]src.Video, 0, len(resp.Data.Result))
 	for _, item := range resp.Data.Result {
 		videos = append(videos, src.Video{
@@ -71,38 +85,6 @@ func (c *BiliSearchCrawler) SearchPage(ctx context.Context, keyword string, page
 		TotalCount: resp.Data.NumTotal,
 	}
 
+	log.Printf("INFO: [bilibili] Search page %d: %d videos found", page, len(videos))
 	return videos, pageInfo, nil
-}
-
-// htmlTagRegex matches HTML tags like <em class="keyword">.
-var htmlTagRegex = regexp.MustCompile(`<[^>]*>`)
-
-// stripHTMLTags removes HTML tags from search result titles.
-// Bilibili search API wraps matched keywords in <em> tags.
-func stripHTMLTags(s string) string {
-	return htmlTagRegex.ReplaceAllString(s, "")
-}
-
-// parseDuration converts a duration string like "12:34" or "1:02:03" to seconds.
-func parseDuration(s string) int {
-	parts := strings.Split(s, ":")
-	total := 0
-
-	switch len(parts) {
-	case 2: // mm:ss
-		m, _ := strconv.Atoi(parts[0])
-		sec, _ := strconv.Atoi(parts[1])
-		total = m*60 + sec
-	case 3: // hh:mm:ss
-		h, _ := strconv.Atoi(parts[0])
-		m, _ := strconv.Atoi(parts[1])
-		sec, _ := strconv.Atoi(parts[2])
-		total = h*3600 + m*60 + sec
-	default:
-		// Try parsing as pure seconds.
-		n, _ := strconv.Atoi(s)
-		total = n
-	}
-
-	return int(math.Abs(float64(total)))
 }

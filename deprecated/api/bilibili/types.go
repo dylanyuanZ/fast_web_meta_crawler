@@ -1,20 +1,6 @@
 package bilibili
 
-import (
-	"math"
-	"regexp"
-	"strconv"
-	"strings"
-)
-
-// videoPageSize is the Bilibili default page size for video list API.
-const videoPageSize = 50
-
-// VideoPageSize returns the page size used for video list requests.
-// Exposed for the orchestration layer to calculate max pages.
-func VideoPageSize() int {
-	return videoPageSize
-}
+import "fmt"
 
 // ==================== Search API Response ====================
 // API: GET https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword=xxx&page=N
@@ -113,37 +99,28 @@ type VideoListPage struct {
 	Count int `json:"count"` // total video count
 }
 
-// ==================== Helper Functions ====================
+// ==================== API Error ====================
 
-// htmlTagRegex matches HTML tags like <em class="keyword">.
-var htmlTagRegex = regexp.MustCompile(`<[^>]*>`)
-
-// stripHTMLTags removes HTML tags from search result titles.
-// Bilibili search API wraps matched keywords in <em> tags.
-func stripHTMLTags(s string) string {
-	return htmlTagRegex.ReplaceAllString(s, "")
+// retryableAPICodes lists Bilibili API error codes that are transient and should be retried.
+// -799: request too frequent; -352: risk control check failed.
+var retryableAPICodes = map[int]bool{
+	-799: true,
+	-352: true,
 }
 
-// parseDuration converts a duration string like "12:34" or "1:02:03" to seconds.
-func parseDuration(s string) int {
-	parts := strings.Split(s, ":")
-	total := 0
+// apiError represents a Bilibili API business error with a code and message.
+// It implements the error interface and supports retry detection via IsRetryable().
+type apiError struct {
+	Code    int
+	Message string
+	Context string // e.g. "search page 3", "user info mid=123"
+}
 
-	switch len(parts) {
-	case 2: // mm:ss
-		m, _ := strconv.Atoi(parts[0])
-		sec, _ := strconv.Atoi(parts[1])
-		total = m*60 + sec
-	case 3: // hh:mm:ss
-		h, _ := strconv.Atoi(parts[0])
-		m, _ := strconv.Atoi(parts[1])
-		sec, _ := strconv.Atoi(parts[2])
-		total = h*3600 + m*60 + sec
-	default:
-		// Try parsing as pure seconds.
-		n, _ := strconv.Atoi(s)
-		total = n
-	}
+func (e *apiError) Error() string {
+	return fmt.Sprintf("API error (code=%d, message=%s) [%s]", e.Code, e.Message, e.Context)
+}
 
-	return int(math.Abs(float64(total)))
+// IsRetryable returns true if this API error code is known to be transient.
+func (e *apiError) IsRetryable() bool {
+	return retryableAPICodes[e.Code]
 }

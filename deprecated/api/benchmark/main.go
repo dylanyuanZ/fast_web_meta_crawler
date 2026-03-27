@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dylanyuanZ/fast_web_meta_crawler/deprecated/api/httpclient"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/config"
-	"github.com/dylanyuanZ/fast_web_meta_crawler/src/httpclient"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/platform/bilibili"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/pool"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/stats"

@@ -12,15 +12,12 @@ import (
 const (
 	DefaultMaxSearchPage          = 50
 	DefaultMaxVideoPerAuthor      = 1000
-	DefaultConcurrency            = 2
-	DefaultHTTPTimeout            = 15 * time.Second
-	DefaultMaxRetries             = 3
-	DefaultInitialDelay           = 2 * time.Second
-	DefaultMaxDelay               = 15 * time.Second
-	DefaultBackoffFactor          = 2.0
+	DefaultConcurrency            = 3
 	DefaultMaxConsecutiveFailures = 10
 	DefaultOutputDir              = "data/"
-	DefaultRequestInterval        = 1200 * time.Millisecond
+	DefaultRequestInterval        = 500 * time.Millisecond
+	DefaultBrowserHeadless        = true
+	DefaultBrowserUserDataDir     = "data/browser-profile/"
 )
 
 // Clamp boundaries.
@@ -33,13 +30,18 @@ const (
 	MaxConcurrency       = 16
 )
 
-// HTTPConfig holds HTTP client configuration.
-type HTTPConfig struct {
-	Timeout       time.Duration `yaml:"timeout"`
-	MaxRetries    int           `yaml:"max_retries"`
-	InitialDelay  time.Duration `yaml:"initial_delay"`
-	MaxDelay      time.Duration `yaml:"max_delay"`
-	BackoffFactor float64       `yaml:"backoff_factor"`
+// BrowserConfig holds browser automation configuration.
+type BrowserConfig struct {
+	Headless    *bool  `yaml:"headless"`      // headless mode (default true, use pointer to distinguish unset from false)
+	UserDataDir string `yaml:"user_data_dir"` // browser profile directory for login persistence
+}
+
+// IsHeadless returns the effective headless value (defaults to true if not set).
+func (b BrowserConfig) IsHeadless() bool {
+	if b.Headless == nil {
+		return DefaultBrowserHeadless
+	}
+	return *b.Headless
 }
 
 // Config holds all application configuration.
@@ -47,7 +49,7 @@ type Config struct {
 	MaxSearchPage          int           `yaml:"max_search_page"`
 	MaxVideoPerAuthor      int           `yaml:"max_video_per_author"`
 	Concurrency            int           `yaml:"concurrency"`
-	HTTP                   HTTPConfig    `yaml:"http"`
+	Browser                BrowserConfig `yaml:"browser"`
 	MaxConsecutiveFailures int           `yaml:"max_consecutive_failures"`
 	OutputDir              string        `yaml:"output_dir"`
 	Cookie                 string        `yaml:"cookie"`
@@ -97,21 +99,12 @@ func applyDefaults(cfg *Config) {
 	if cfg.Concurrency == 0 {
 		cfg.Concurrency = DefaultConcurrency
 	}
-	if cfg.HTTP.Timeout == 0 {
-		cfg.HTTP.Timeout = DefaultHTTPTimeout
+	if cfg.Browser.UserDataDir == "" {
+		cfg.Browser.UserDataDir = DefaultBrowserUserDataDir
 	}
-	if cfg.HTTP.MaxRetries == 0 {
-		cfg.HTTP.MaxRetries = DefaultMaxRetries
-	}
-	if cfg.HTTP.InitialDelay == 0 {
-		cfg.HTTP.InitialDelay = DefaultInitialDelay
-	}
-	if cfg.HTTP.MaxDelay == 0 {
-		cfg.HTTP.MaxDelay = DefaultMaxDelay
-	}
-	if cfg.HTTP.BackoffFactor == 0 {
-		cfg.HTTP.BackoffFactor = DefaultBackoffFactor
-	}
+	// Note: cfg.Browser.Headless uses *bool pointer.
+	// nil means "not set" → defaults to true via IsHeadless() method.
+	// Explicit false in YAML will be preserved.
 	if cfg.MaxConsecutiveFailures == 0 {
 		cfg.MaxConsecutiveFailures = DefaultMaxConsecutiveFailures
 	}

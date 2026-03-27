@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dylanyuanZ/fast_web_meta_crawler/src/httpclient"
+	"github.com/dylanyuanZ/fast_web_meta_crawler/deprecated/api/httpclient"
 )
 
 // wbiSigner handles Bilibili's wbi signature generation.
