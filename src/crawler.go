@@ -51,14 +51,36 @@ type AuthorCrawler interface {
 }
 
 // RunStage0 orchestrates stage 0: search → paginate → collect → deduplicate → export CSV.
-// Internally calls SearchCrawler.SearchPage via Worker Pool, writes video CSV and
-// intermediate data file (deduplicated AuthorMid list).
+// Each page's videos are written to CSV immediately after fetching (real-time persistence).
+// Internally calls SearchCrawler.SearchPage via Worker Pool.
 // Returns the AuthorMid list for stage 1 consumption.
 func RunStage0(ctx context.Context, sc SearchCrawler, keyword string, cfg Stage0Config) ([]AuthorMid, error) {
 	start := time.Now()
 	log.Printf("INFO: Stage 0 started, keyword=%q", keyword)
 
-	// Step 1: Fetch first page to get total pages.
+	// Step 1: Create or open VideoCSVWriter.
+	var csvWriter VideoCSVRowWriter
+	var err error
+	if cfg.ExistingVideoCSVPath != "" {
+		// Resume: open existing CSV in append mode (no header).
+		csvWriter, err = cfg.OpenVideoCSVWriter(cfg.ExistingVideoCSVPath)
+	} else {
+		// First run: create new CSV with BOM + header.
+		csvWriter, err = cfg.NewVideoCSVWriter(cfg.OutputDir, cfg.Platform, keyword)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("create/open video CSV writer: %w", err)
+	}
+	defer csvWriter.Close()
+
+	// Step 2: Record CSV path in progress.
+	if cfg.Progress != nil {
+		if saveErr := cfg.Progress.SetVideoCSVPath(cfg.OutputDir, csvWriter.FilePath()); saveErr != nil {
+			log.Printf("WARN: failed to save video CSV path to progress: %v", saveErr)
+		}
+	}
+
+	// Step 3: Fetch first page to get total pages.
 	firstVideos, pageInfo, err := sc.SearchPage(ctx, keyword, 1)
 	if err != nil {
 		return nil, fmt.Errorf("fetch first page: %w", err)
@@ -70,23 +92,29 @@ func RunStage0(ctx context.Context, sc SearchCrawler, keyword string, cfg Stage0
 	}
 	log.Printf("INFO: Search found %d total pages, will fetch %d pages", pageInfo.TotalPages, actualPages)
 
-	// Record first page in progress if available.
-	allVideos := make([]Video, 0, len(firstVideos)*actualPages)
-	allVideos = append(allVideos, firstVideos...)
-
 	completedPages := make(map[int]bool)
 	if cfg.Progress != nil {
 		completedPages = cfg.Progress.CompletedPages()
 	}
-	completedPages[1] = true
 
-	if cfg.Progress != nil {
-		if err := cfg.Progress.AddSearchPage(cfg.OutputDir, 1); err != nil {
-			log.Printf("WARN: failed to save progress for page 1: %v", err)
+	// Write first page videos to CSV immediately (only if not already completed in a previous run).
+	if !completedPages[1] {
+		if writeErr := csvWriter.WriteRows(firstVideos); writeErr != nil {
+			log.Printf("WARN: failed to write first page videos to CSV: %v", writeErr)
 		}
 	}
 
-	// Step 2: Build remaining page tasks (skip already completed pages).
+	// Record first page progress only if not already completed.
+	if !completedPages[1] {
+		completedPages[1] = true
+		if cfg.Progress != nil {
+			if err := cfg.Progress.AddSearchPage(cfg.OutputDir, 1); err != nil {
+				log.Printf("WARN: failed to save progress for page 1: %v", err)
+			}
+		}
+	}
+
+	// Step 4: Build remaining page tasks (skip already completed pages).
 	var remainingPages []int
 	for p := 2; p <= actualPages; p++ {
 		if !completedPages[p] {
@@ -94,13 +122,19 @@ func RunStage0(ctx context.Context, sc SearchCrawler, keyword string, cfg Stage0
 		}
 	}
 
-	// Step 3: Worker Pool for remaining pages.
+	// Step 5: Worker Pool for remaining pages — worker writes to CSV immediately.
+	successCount := 1 // first page already succeeded
+	failCount := 0
 	if len(remainingPages) > 0 {
 		results := cfg.PoolRun(ctx, cfg.Concurrency, remainingPages,
 			func(ctx context.Context, page int) ([]Video, error) {
 				videos, _, err := sc.SearchPage(ctx, keyword, page)
 				if err != nil {
 					return nil, err
+				}
+				// Write to CSV immediately (real-time persistence).
+				if writeErr := csvWriter.WriteRows(videos); writeErr != nil {
+					log.Printf("WARN: failed to write page %d videos to CSV: %v", page, writeErr)
 				}
 				// Record progress for this page.
 				if cfg.Progress != nil {
@@ -114,22 +148,30 @@ func RunStage0(ctx context.Context, sc SearchCrawler, keyword string, cfg Stage0
 			cfg.RequestInterval,
 		)
 
-		// Collect results.
-		successCount := 0
-		failCount := 0
+		// Collect results (only for counting, data is already in CSV).
 		for _, r := range results {
 			if r.Err != nil {
 				failCount++
 				log.Printf("ERROR: Failed to fetch page %d: %v", r.Task, r.Err)
 			} else {
 				successCount++
-				allVideos = append(allVideos, r.Result...)
 			}
 		}
-		log.Printf("INFO: [Stage 0] Pages: success=%d, failed=%d", successCount+1, failCount)
+	}
+	log.Printf("INFO: [Stage 0] Pages: success=%d, failed=%d", successCount, failCount)
+
+	// Step 6: Close CSV writer before reading.
+	if err := csvWriter.Close(); err != nil {
+		log.Printf("WARN: failed to close video CSV writer: %v", err)
 	}
 
-	// Step 4: Deduplicate by AuthorID.
+	// Step 7: Read all videos from CSV for deduplication.
+	allVideos, err := cfg.ReadVideoCSV(csvWriter.FilePath())
+	if err != nil {
+		return nil, fmt.Errorf("read video CSV for dedup: %w", err)
+	}
+
+	// Step 8: Deduplicate by AuthorID.
 	seen := make(map[string]bool)
 	var mids []AuthorMid
 	for _, v := range allVideos {
@@ -140,20 +182,14 @@ func RunStage0(ctx context.Context, sc SearchCrawler, keyword string, cfg Stage0
 	}
 
 	log.Printf("INFO: [Stage 0] Total videos: %d, Unique authors: %d", len(allVideos), len(mids))
+	log.Printf("INFO: [Stage 0] Video CSV: %s", csvWriter.FilePath())
 
-	// Step 5: Write video CSV.
-	videoPath, err := cfg.WriteVideoCSV(cfg.OutputDir, allVideos, cfg.Platform, keyword)
-	if err != nil {
-		return nil, fmt.Errorf("write video CSV: %w", err)
-	}
-	log.Printf("INFO: [Stage 0] Video CSV written: %s", videoPath)
-
-	// Step 6: Write intermediate data file (author mids as JSON).
+	// Step 9: Write intermediate data file (author mids as JSON).
 	if err := writeIntermediateData(cfg.OutputDir, cfg.Platform, keyword, mids); err != nil {
 		return nil, fmt.Errorf("write intermediate data: %w", err)
 	}
 
-	// Step 7: Update progress to stage 1.
+	// Step 10: Update progress to stage 1.
 	if cfg.Progress != nil {
 		if err := cfg.Progress.SetAuthorMids(cfg.OutputDir, mids); err != nil {
 			log.Printf("WARN: failed to update progress to stage 1: %v", err)
@@ -165,6 +201,7 @@ func RunStage0(ctx context.Context, sc SearchCrawler, keyword string, cfg Stage0
 }
 
 // RunStage1 orchestrates stage 1: iterate authors → fetch details → calc stats → export CSV.
+// Each author is written to CSV immediately after processing (real-time persistence).
 // Internally uses Worker Pool for author-level concurrency.
 func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stage1Config) error {
 	start := time.Now()
@@ -175,17 +212,38 @@ func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 		return nil
 	}
 
+	// Step 1: Create or open CSVWriter.
+	var csvWriter AuthorCSVRowWriter
+	var err error
+	if cfg.ExistingCSVPath != "" {
+		// Resume: open existing CSV in append mode (no header).
+		csvWriter, err = cfg.OpenAuthorCSVWriter(cfg.ExistingCSVPath)
+	} else {
+		// First run: create new CSV with BOM + header.
+		csvWriter, err = cfg.NewAuthorCSVWriter(cfg.OutputDir, cfg.Platform, cfg.Keyword)
+	}
+	if err != nil {
+		return fmt.Errorf("create/open author CSV writer: %w", err)
+	}
+	defer csvWriter.Close()
+
+	// Step 2: Record CSV path in progress.
+	if cfg.Progress != nil {
+		if saveErr := cfg.Progress.SetAuthorCSVPath(cfg.OutputDir, csvWriter.FilePath()); saveErr != nil {
+			log.Printf("WARN: failed to save author CSV path to progress: %v", saveErr)
+		}
+	}
+
+	// Step 3: Worker Pool — worker closure captures csvWriter for real-time CSV writing.
 	results := cfg.PoolRun(ctx, cfg.Concurrency, mids,
 		func(ctx context.Context, mid AuthorMid) (Author, error) {
 			author, err := processOneAuthor(ctx, ac, mid, cfg)
 			if err != nil {
 				return Author{}, err
 			}
-			// Mark this author as done in progress.
-			if cfg.Progress != nil {
-				if saveErr := cfg.Progress.MarkDone(cfg.OutputDir, mid.ID); saveErr != nil {
-					log.Printf("WARN: failed to mark author %s as done: %v", mid.ID, saveErr)
-				}
+			// Write to CSV immediately (replaces old MarkDone).
+			if writeErr := csvWriter.WriteRow(author); writeErr != nil {
+				log.Printf("WARN: failed to write author %s to CSV: %v", mid.ID, writeErr)
 			}
 			return author, nil
 		},
@@ -193,8 +251,7 @@ func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 		cfg.RequestInterval,
 	)
 
-	// Collect results.
-	var authors []Author
+	// Step 4: Collect and log results.
 	successCount := 0
 	failCount := 0
 	for _, r := range results {
@@ -203,18 +260,11 @@ func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 			log.Printf("ERROR: Failed to fetch author %s (mid=%s): %v", r.Task.Name, r.Task.ID, r.Err)
 		} else {
 			successCount++
-			authors = append(authors, r.Result)
 		}
 	}
 
 	log.Printf("INFO: [Stage 1] Authors: success=%d, failed=%d", successCount, failCount)
-
-	// Write author CSV.
-	authorPath, err := cfg.WriteAuthorCSV(cfg.OutputDir, authors, cfg.Platform, cfg.Keyword)
-	if err != nil {
-		return fmt.Errorf("write author CSV: %w", err)
-	}
-	log.Printf("INFO: [Stage 1] Author CSV written: %s", authorPath)
+	log.Printf("INFO: [Stage 1] Author CSV: %s", csvWriter.FilePath())
 	log.Printf("INFO: [Stage 1] Completed in %v", time.Since(start).Round(time.Second))
 
 	return nil
@@ -290,7 +340,10 @@ type Stage0Config struct {
 	RequestInterval        time.Duration
 	Progress               ProgressTracker
 	PoolRun                PoolRunFunc[int, []Video]
-	WriteVideoCSV          func(outputDir string, videos []Video, platform, keyword string) (string, error)
+	NewVideoCSVWriter      func(outputDir, platform, keyword string) (VideoCSVRowWriter, error)
+	OpenVideoCSVWriter     func(existingPath string) (VideoCSVRowWriter, error)
+	ReadVideoCSV           func(csvPath string) ([]Video, error)
+	ExistingVideoCSVPath   string // non-empty when resuming from a previous run
 }
 
 // Stage1Config holds dependencies for RunStage1, enabling testability.
@@ -305,9 +358,27 @@ type Stage1Config struct {
 	RequestInterval        time.Duration
 	Progress               ProgressTracker
 	PoolRun                PoolRunFunc[AuthorMid, Author]
-	WriteAuthorCSV         func(outputDir string, authors []Author, platform, keyword string) (string, error)
+	NewAuthorCSVWriter     func(outputDir, platform, keyword string) (AuthorCSVRowWriter, error)
+	OpenAuthorCSVWriter    func(existingPath string) (AuthorCSVRowWriter, error)
+	ExistingCSVPath        string // non-empty when resuming from a previous run
 	CalcAuthorStats        func(videos []VideoDetail, topN int) (AuthorStats, []TopVideo)
 	DetectLanguage         func(titles []string) string
+}
+
+// AuthorCSVRowWriter abstracts incremental CSV writing for author data.
+// Implemented by export.AuthorCSVWriter; defined here to avoid circular imports.
+type AuthorCSVRowWriter interface {
+	WriteRow(author Author) error
+	FilePath() string
+	Close() error
+}
+
+// VideoCSVRowWriter abstracts incremental CSV writing for video data.
+// Implemented by export.VideoCSVWriter; defined here to avoid circular imports.
+type VideoCSVRowWriter interface {
+	WriteRows(videos []Video) error
+	FilePath() string
+	Close() error
 }
 
 // ProgressTracker abstracts progress operations to avoid circular imports with progress package.
@@ -315,7 +386,8 @@ type ProgressTracker interface {
 	CompletedPages() map[int]bool
 	AddSearchPage(outputDir string, page int) error
 	SetAuthorMids(outputDir string, mids []AuthorMid) error
-	MarkDone(outputDir string, mid string) error
+	SetAuthorCSVPath(outputDir string, csvPath string) error
+	SetVideoCSVPath(outputDir string, csvPath string) error
 }
 
 // ==================== Intermediate data file ====================

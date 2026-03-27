@@ -15,13 +15,14 @@ import (
 
 // Progress represents the checkpoint state for resumable crawling.
 type Progress struct {
-	Platform    string          `json:"platform"`
-	Keyword     string          `json:"keyword"`
-	Stage       int             `json:"stage"`
-	SearchPages []int           `json:"search_pages"`
-	AuthorMids  []src.AuthorMid `json:"author_mids"`
-	DoneAuthors map[string]bool `json:"done_authors"`
-	UpdatedAt   time.Time       `json:"updated_at"`
+	Platform      string          `json:"platform"`
+	Keyword       string          `json:"keyword"`
+	Stage         int             `json:"stage"`
+	SearchPages   []int           `json:"search_pages"`
+	AuthorMids    []src.AuthorMid `json:"author_mids"`
+	AuthorCSVPath string          `json:"author_csv_path"`
+	VideoCSVPath  string          `json:"video_csv_path"`
+	UpdatedAt     time.Time       `json:"updated_at"`
 
 	mu sync.Mutex // protects concurrent writes
 }
@@ -69,11 +70,6 @@ func Load(outputDir, platform, keyword string) *Progress {
 		return nil
 	}
 
-	// Ensure DoneAuthors map is initialized.
-	if p.DoneAuthors == nil {
-		p.DoneAuthors = make(map[string]bool)
-	}
-
 	return p
 }
 
@@ -85,7 +81,6 @@ func NewProgress(platform, keyword string) *Progress {
 		Stage:       0,
 		SearchPages: make([]int, 0),
 		AuthorMids:  make([]src.AuthorMid, 0),
-		DoneAuthors: make(map[string]bool),
 		UpdatedAt:   time.Now(),
 	}
 }
@@ -137,10 +132,18 @@ func (p *Progress) SetAuthorMids(outputDir string, mids []src.AuthorMid) error {
 	return p.Save(outputDir)
 }
 
-// MarkDone marks an author as completed in stage 1 and persists the progress.
-func (p *Progress) MarkDone(outputDir string, mid string) error {
+// SetAuthorCSVPath records the author CSV file path in progress and persists it.
+func (p *Progress) SetAuthorCSVPath(outputDir string, csvPath string) error {
 	p.mu.Lock()
-	p.DoneAuthors[mid] = true
+	p.AuthorCSVPath = csvPath
+	p.mu.Unlock()
+	return p.Save(outputDir)
+}
+
+// SetVideoCSVPath records the video CSV file path in progress and persists it.
+func (p *Progress) SetVideoCSVPath(outputDir string, csvPath string) error {
+	p.mu.Lock()
+	p.VideoCSVPath = csvPath
 	p.mu.Unlock()
 	return p.Save(outputDir)
 }
@@ -155,20 +158,6 @@ func (p *Progress) CompletedPages() map[int]bool {
 		set[page] = true
 	}
 	return set
-}
-
-// PendingAuthors returns the list of authors not yet completed in stage 1.
-func (p *Progress) PendingAuthors() []src.AuthorMid {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	pending := make([]src.AuthorMid, 0)
-	for _, mid := range p.AuthorMids {
-		if !p.DoneAuthors[mid.ID] {
-			pending = append(pending, mid)
-		}
-	}
-	return pending
 }
 
 // Clean removes the progress file after task completion.

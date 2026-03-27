@@ -129,6 +129,13 @@ func main() {
 	runStage1 := *stage == "1" || *stage == "all"
 
 	if runStage0 && (prog.Stage == 0 || *stage == "0") {
+		// Determine if resuming with existing video CSV.
+		var existingVideoCSVPath string
+		if prog.VideoCSVPath != "" && len(prog.SearchPages) > 0 {
+			existingVideoCSVPath = prog.VideoCSVPath
+			log.Printf("INFO: Resuming Stage 0 with existing video CSV: %s", existingVideoCSVPath)
+		}
+
 		stage0Cfg := src.Stage0Config{
 			Platform:               *platform,
 			OutputDir:              cfg.OutputDir,
@@ -138,7 +145,14 @@ func main() {
 			RequestInterval:        cfg.RequestInterval,
 			Progress:               prog,
 			PoolRun:                adaptPoolRun[int, []src.Video],
-			WriteVideoCSV:          export.WriteVideoCSV,
+			NewVideoCSVWriter: func(outputDir, platform, keyword string) (src.VideoCSVRowWriter, error) {
+				return export.NewVideoCSVWriter(outputDir, platform, keyword)
+			},
+			OpenVideoCSVWriter: func(existingPath string) (src.VideoCSVRowWriter, error) {
+				return export.OpenVideoCSVWriter(existingPath)
+			},
+			ReadVideoCSV:         export.ReadVideoCSV,
+			ExistingVideoCSVPath: existingVideoCSVPath,
 		}
 
 		var err error
@@ -150,10 +164,30 @@ func main() {
 
 	if runStage1 {
 		// If stage 1 only, load mids from intermediate data or progress file.
+		var existingCSVPath string
 		if !runStage0 || mids == nil {
 			if prog.Stage >= 1 && len(prog.AuthorMids) > 0 {
-				mids = prog.PendingAuthors()
-				log.Printf("INFO: Loaded %d pending authors from progress file", len(mids))
+				mids = prog.AuthorMids
+				log.Printf("INFO: Loaded %d authors from progress file", len(mids))
+
+				// Resume: filter out already completed authors using CSV.
+				if prog.AuthorCSVPath != "" {
+					existingCSVPath = prog.AuthorCSVPath
+					completedIDs, err := export.ReadCompletedAuthors(prog.AuthorCSVPath)
+					if err != nil {
+						log.Fatalf("FATAL: Failed to read completed authors from CSV: %v", err)
+					}
+					if len(completedIDs) > 0 {
+						var pending []src.AuthorMid
+						for _, mid := range mids {
+							if !completedIDs[mid.ID] {
+								pending = append(pending, mid)
+							}
+						}
+						log.Printf("INFO: Resuming: %d completed, %d pending", len(completedIDs), len(pending))
+						mids = pending
+					}
+				}
 			} else {
 				var err error
 				mids, err = src.LoadIntermediateData(cfg.OutputDir, *platform, *keyword)
@@ -181,9 +215,15 @@ func main() {
 			RequestInterval:        cfg.RequestInterval,
 			Progress:               prog,
 			PoolRun:                adaptPoolRun[src.AuthorMid, src.Author],
-			WriteAuthorCSV:         export.WriteAuthorCSV,
-			CalcAuthorStats:        stats.CalcAuthorStats,
-			DetectLanguage:         stats.DetectLanguage,
+			NewAuthorCSVWriter: func(outputDir, platform, keyword string) (src.AuthorCSVRowWriter, error) {
+				return export.NewAuthorCSVWriter(outputDir, platform, keyword)
+			},
+			OpenAuthorCSVWriter: func(existingPath string) (src.AuthorCSVRowWriter, error) {
+				return export.OpenAuthorCSVWriter(existingPath)
+			},
+			ExistingCSVPath: existingCSVPath,
+			CalcAuthorStats: stats.CalcAuthorStats,
+			DetectLanguage:  stats.DetectLanguage,
 		}
 
 		if err := src.RunStage1(ctx, authorCrawler, mids, stage1Cfg); err != nil {
