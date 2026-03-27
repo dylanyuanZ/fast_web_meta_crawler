@@ -7,8 +7,9 @@ import (
 	"strings"
 )
 
-// videoPageSize is the Bilibili default page size for video list API.
-const videoPageSize = 50
+// videoPageSize is the Bilibili default page size for video list API in browser mode.
+// The browser's space page uses ps=40 by default (verified via network probe on 2026-03-27).
+const videoPageSize = 40
 
 // VideoPageSize returns the page size used for video list requests.
 // Exposed for the orchestration layer to calculate max pages.

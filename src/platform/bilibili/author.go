@@ -10,6 +10,7 @@ import (
 
 	src "github.com/dylanyuanZ/fast_web_meta_crawler/src"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/browser"
+	"github.com/dylanyuanZ/fast_web_meta_crawler/src/pool"
 	"github.com/go-rod/rod"
 )
 
@@ -36,7 +37,7 @@ func (c *BiliBrowserAuthorCrawler) FetchAuthorInfo(ctx context.Context, mid stri
 	targetURL := fmt.Sprintf("https://space.bilibili.com/%s", mid)
 
 	rules := []browser.InterceptRule{
-		{URLPattern: "/x/space/acc/info", ID: "user_info"},
+		{URLPattern: "/x/space/wbi/acc/info", ID: "user_info"},
 		{URLPattern: "/x/relation/stat", ID: "user_stat"},
 	}
 
@@ -90,26 +91,38 @@ func (c *BiliBrowserAuthorCrawler) FetchAuthorInfo(ctx context.Context, mid stri
 	}, nil
 }
 
-// FetchAuthorVideos opens the author's video tab and intercepts the video list API.
-// URL: https://space.bilibili.com/{mid}/video?pn={page}
-// Intercepts: /x/space/wbi/arc/search
-func (c *BiliBrowserAuthorCrawler) FetchAuthorVideos(ctx context.Context, mid string, page int) ([]src.VideoDetail, src.PageInfo, error) {
+// nextPageButtonSelector is the CSS selector for the "next page" button on Bilibili space video tab.
+// Verified via network probe: the pagination uses Vue UI components.
+const nextPageButtonSelector = "button.vui_pagenation--btn-side:last-child"
+
+// paginationInterval is the delay between clicking "next page" buttons.
+// Slightly shorter than inter-request interval since these are lightweight UI clicks
+// within the same page, but still needed to avoid triggering SPA rate limits.
+const paginationInterval = 800 * time.Millisecond
+
+// FetchAllAuthorVideos navigates to the author's video tab and fetches all videos
+// by paginating from page 1 to the last page (or until maxVideos is reached).
+//
+// This approach is necessary because Bilibili's space page is a SPA — URL parameters
+// like ?pn=2 do NOT affect the API request's pn value. Pagination must be triggered
+// by clicking the UI "next page" button.
+func (c *BiliBrowserAuthorCrawler) FetchAllAuthorVideos(ctx context.Context, mid string, maxVideos int) ([]src.VideoDetail, src.PageInfo, error) {
 	p := c.manager.GetPage()
 	defer c.manager.PutPage(p)
 
-	targetURL := fmt.Sprintf("https://space.bilibili.com/%s/video?pn=%d", mid, page)
+	targetURL := fmt.Sprintf("https://space.bilibili.com/%s/video", mid)
 
 	rules := []browser.InterceptRule{{
 		URLPattern: "/x/space/wbi/arc/search",
 		ID:         "video_list",
 	}}
 
+	// Step 1: Navigate to video tab and intercept page 1 API.
 	results, err := browser.NavigateAndIntercept(ctx, p, targetURL, rules)
 	if err != nil {
-		return nil, src.PageInfo{}, fmt.Errorf("fetch videos mid=%s page=%d: %w", mid, page, err)
+		return nil, src.PageInfo{}, fmt.Errorf("fetch videos mid=%s: navigate failed: %w", mid, err)
 	}
 
-	// Extract response body.
 	var videoBody []byte
 	for _, r := range results {
 		if r.ID == "video_list" {
@@ -117,13 +130,112 @@ func (c *BiliBrowserAuthorCrawler) FetchAuthorVideos(ctx context.Context, mid st
 			break
 		}
 	}
+
 	if videoBody == nil {
-		return nil, src.PageInfo{}, fmt.Errorf("fetch videos mid=%s page=%d: video list API not intercepted", mid, page)
+		return nil, src.PageInfo{}, fmt.Errorf("fetch videos mid=%s: video list API not intercepted", mid)
 	}
 
-	// Parse JSON response.
+	// Validate page 1 response before attempting pagination.
+	// If the initial API response is invalid (e.g. non-JSON from risk control,
+	// or API error code), there's no point clicking pagination buttons.
+	var quickCheck struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(videoBody, &quickCheck); err != nil {
+		return nil, src.PageInfo{}, fmt.Errorf("fetch videos mid=%s: page 1 response is not valid JSON (likely risk control HTML): %w", mid, err)
+	}
+	if quickCheck.Code != 0 {
+		return nil, src.PageInfo{}, fmt.Errorf("fetch videos mid=%s: page 1 API error (code=%d)", mid, quickCheck.Code)
+	}
+
+	// Parse page 1 to get videos and total page count.
+	firstVideos, pageInfo, err := c.parseVideoListResponse(videoBody, mid, 1)
+	if err != nil {
+		return nil, src.PageInfo{}, err
+	}
+
+	capacity := pageInfo.TotalCount
+	if maxVideos < capacity {
+		capacity = maxVideos
+	}
+	allVideos := make([]src.VideoDetail, 0, capacity)
+	allVideos = append(allVideos, firstVideos...)
+
+	// Step 2: Click "next page" to fetch remaining pages within the same tab.
+	for currentPage := 2; currentPage <= pageInfo.TotalPages; currentPage++ {
+		if ctx.Err() != nil {
+			return nil, src.PageInfo{}, ctx.Err()
+		}
+
+		// Cap at maxVideos.
+		if len(allVideos) >= maxVideos {
+			allVideos = allVideos[:maxVideos]
+			break
+		}
+
+		// Brief pause between page clicks with jitter.
+		time.Sleep(pool.JitteredDuration(paginationInterval))
+
+		// Set up intercept BEFORE clicking.
+		waitFn := browser.WaitForIntercept(ctx, p, rules)
+
+		// Click the "next page" button.
+		_, err := p.Eval(fmt.Sprintf(`() => {
+			let btn = document.querySelector('%s');
+			if (btn && !btn.disabled) {
+				btn.click();
+				return 'clicked';
+			}
+			return 'not found or disabled';
+		}`, nextPageButtonSelector))
+		if err != nil {
+			log.Printf("WARN: [bilibili] click next page failed mid=%s page=%d: %v", mid, currentPage, err)
+			break
+		}
+
+		// Wait for the new API response.
+		nextResults, err := waitFn()
+		if err != nil {
+			log.Printf("WARN: [bilibili] intercept page %d mid=%s failed: %v", currentPage, mid, err)
+			break
+		}
+
+		// Extract video body from results.
+		var nextBody []byte
+		for _, r := range nextResults {
+			if r.ID == "video_list" {
+				nextBody = r.Body
+				break
+			}
+		}
+		if nextBody == nil {
+			log.Printf("WARN: [bilibili] page %d mid=%s: video list not in intercept results", currentPage, mid)
+			break
+		}
+
+		// Parse this page's videos.
+		pageVideos, _, err := c.parseVideoListResponse(nextBody, mid, currentPage)
+		if err != nil {
+			log.Printf("WARN: [bilibili] parse page %d mid=%s failed: %v", currentPage, mid, err)
+			break
+		}
+
+		allVideos = append(allVideos, pageVideos...)
+	}
+
+	// Final cap at maxVideos.
+	if len(allVideos) > maxVideos {
+		allVideos = allVideos[:maxVideos]
+	}
+
+	log.Printf("INFO: [bilibili] All videos fetched: mid=%s, pages=%d, total=%d", mid, pageInfo.TotalPages, len(allVideos))
+	return allVideos, pageInfo, nil
+}
+
+// parseVideoListResponse parses a video list API response body into common types.
+func (c *BiliBrowserAuthorCrawler) parseVideoListResponse(body []byte, mid string, page int) ([]src.VideoDetail, src.PageInfo, error) {
 	var resp VideoListResp
-	if err := json.Unmarshal(videoBody, &resp); err != nil {
+	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, src.PageInfo{}, fmt.Errorf("parse video list mid=%s page=%d: %w", mid, page, err)
 	}
 	if resp.Code != 0 {
@@ -146,8 +258,14 @@ func (c *BiliBrowserAuthorCrawler) FetchAuthorVideos(ctx context.Context, mid st
 
 	totalCount := resp.Data.Page.Count
 	totalPages := 1
-	if videoPageSize > 0 {
-		totalPages = int(math.Ceil(float64(totalCount) / float64(videoPageSize)))
+	// Use the actual page size from the API response (ps field) to calculate total pages.
+	// The browser may use different ps values (25 or 40) depending on the page context.
+	actualPS := resp.Data.Page.PS
+	if actualPS <= 0 {
+		actualPS = videoPageSize // fallback to default
+	}
+	if actualPS > 0 {
+		totalPages = int(math.Ceil(float64(totalCount) / float64(actualPS)))
 	}
 
 	pageInfo := src.PageInfo{

@@ -28,6 +28,7 @@ func main() {
 	keyword := flag.String("keyword", "", "Search keyword")
 	stage := flag.String("stage", "all", "Stage to run: 0, 1, or all")
 	configPath := flag.String("config", "conf/config.yaml", "Path to config file")
+	limit := flag.Int("limit", 0, "Limit number of authors to process in stage 1 (0 = no limit, for debugging)")
 	flag.Parse()
 
 	if *platform == "" || *keyword == "" {
@@ -63,11 +64,18 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	// Initialize debug log file for browser network diagnostics.
+	if err := browser.InitDebugLog("log"); err != nil {
+		log.Printf("WARN: failed to init debug log: %v (debug logs will be dropped)", err)
+	}
+	defer browser.CloseDebugLog()
+
 	// Initialize browser Manager.
 	mgr, err := browser.New(browser.Config{
 		Headless:    cfg.Browser.IsHeadless(),
 		UserDataDir: cfg.Browser.UserDataDir,
 		Concurrency: cfg.Concurrency,
+		BrowserBin:  cfg.Browser.Bin,
 	})
 	if err != nil {
 		log.Fatalf("FATAL: failed to create browser manager: %v", err)
@@ -154,6 +162,12 @@ func main() {
 				}
 				log.Printf("INFO: Loaded %d authors from intermediate data file", len(mids))
 			}
+		}
+
+		// Apply --limit for debugging.
+		if *limit > 0 && len(mids) > *limit {
+			log.Printf("INFO: Limiting to first %d authors (--limit flag)", *limit)
+			mids = mids[:*limit]
 		}
 
 		stage1Cfg := src.Stage1Config{

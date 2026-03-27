@@ -45,7 +45,7 @@
 ## 2. 目标 (Goals)
 
 1. **浏览器自动化作为唯一采集方式**：基于 Rod 实现 `SearchCrawler` 和 `AuthorCrawler` 接口的浏览器版本，完全替代已废弃的 API 直调方案
-2. **网络请求拦截**：浏览器方案通过拦截浏览器发出的 API 请求获取结构化 JSON 数据（而非 DOM 解析），数据格式与原 API 方案一致
+2. **结构化数据提取**：浏览器方案通过提取页面 SSR 数据（如 Pinia 状态）或拦截浏览器发出的 API 请求获取结构化 JSON 数据（而非 DOM 解析），数据格式与原 API 方案一致
 3. **登录态管理**：支持手动登录 + user-data-dir 持久化，解决 Cookie 过期问题；服务器无 GUI 环境降级到 Cookie 注入
 4. **并发控制**：复用现有 `concurrency` 配置，作为浏览器实例数（推荐 3-5 个）
 5. **资源可配**：浏览器实例数、headless 模式等参数可配置，适配服务器（2C4G）和本地不同环境
@@ -86,21 +86,22 @@
   - 如果 `cookie` 也未配置，以匿名模式运行
 - 登录态检测：打开平台页面后，通过检查特定元素或 Cookie 判断是否已登录
 
-#### FR-4: 网络请求拦截获取数据
+#### FR-4: 结构化数据提取
 
-- 浏览器打开目标页面后，通过 Rod 的 `HijackRequests` 或事件监听机制，拦截页面 JS 发出的 API 请求
-- 从拦截到的 Response 中提取 JSON 数据，解析为与 API 方案相同的数据结构（`Video`、`AuthorInfo`、`VideoDetail` 等）
-- 对于需要翻页的场景（搜索结果、博主视频列表），通过模拟页面操作（滚动、点击"下一页"）触发浏览器发出后续 API 请求
+- **SSR 数据提取（优先）**：对于服务端渲染（SSR）页面，通过 `page.Eval()` 执行 JS 提取页面全局变量中的结构化数据（如 `window.__pinia`），无需等待 API 请求
+- **网络请求拦截（备选）**：对于客户端渲染页面，通过 Rod 的 CDP 事件监听机制，被动拦截页面 JS 发出的 API 请求，从 Response 中提取 JSON 数据
+- 两种方式提取的数据均解析为与 API 方案相同的数据结构（`Video`、`AuthorInfo`、`VideoDetail` 等）
+- 对于需要翻页的场景，翻页策略取决于页面类型：SSR 页面可通过 URL 参数翻页（直接导航到目标页），SPA 页面需通过模拟点击翻页按钮触发 API 请求
 
 #### FR-5: Bilibili 浏览器实现
 
 - 实现 `BiliBrowserSearchCrawler`（实现 `SearchCrawler` 接口）：
   - 打开 B 站搜索页面 `https://search.bilibili.com/video?keyword=xxx`
-  - 拦截搜索 API 响应，解析为 `[]Video` + `PageInfo`
-  - 通过模拟翻页操作获取后续页面数据
+  - 从 `window.__pinia` 中提取 SSR 搜索结果数据（B 站搜索页为 SSR 渲染，数据嵌入在 Pinia 状态中）
+  - 解析为 `[]Video` + `PageInfo`，通过 URL 参数翻页获取后续页面数据（搜索页为 SSR，URL 参数翻页有效）
 - 实现 `BiliBrowserAuthorCrawler`（实现 `AuthorCrawler` 接口）：
   - `FetchAuthorInfo`：打开博主主页 `https://space.bilibili.com/{mid}`，拦截用户信息和粉丝数 API 响应
-  - `FetchAuthorVideos`：在博主主页的投稿视频 Tab，拦截视频列表 API 响应，模拟翻页获取后续数据
+  - `FetchAuthorVideos`：在博主主页的投稿视频 Tab，拦截视频列表 API 响应，通过点击
 
 #### FR-6: 新入口
 
@@ -138,7 +139,7 @@
 
 #### 核心思路
 
-用 Rod 驱动一个 Chromium 浏览器进程，通过多个 Page（Tab）并发访问目标平台页面，利用网络请求拦截（而非 DOM 解析）获取页面 JS 发出的 API 响应 JSON，解析为与原 API 方案一致的数据结构，注入到现有编排层（`crawler.go`）中运行。
+用 Rod 驱动一个 Chromium 浏览器进程，通过多个 Page（Tab）并发访问目标平台页面，通过 SSR 数据提取或网络请求拦截（而非 DOM 解析）获取结构化 JSON 数据，解析为与原 API 方案一致的数据结构，注入到现有编排层（`crawler.go`）中运行。
 
 #### 模块划分
 
@@ -147,6 +148,8 @@ src/
 ├── browser/                    # 浏览器基础设施层（平台无关）
 │   ├── browser.go              # 浏览器生命周期管理：启动 Browser、创建/回收 Page 池
 │   ├── interceptor.go          # 通用网络请求拦截框架：按 URL pattern 匹配、提取 response body
+│   ├── extractor.go            # SSR 数据提取：导航页面后通过 JS 提取全局变量数据
+│   ├── logger.go               # 调试日志：文件级 debug logger，避免污染控制台
 │   └── auth.go                 # 登录态管理：user-data-dir 持久化、Cookie 注入、登录检测
 │
 ├── platform/
@@ -197,10 +200,16 @@ Stage 0（搜索）:
     → RunStage0(ctx, searchCrawler, keyword, cfg)
       → searchCrawler.SearchPage(ctx, keyword, page)
         → [browser] 打开 B 站搜索页 URL
-        → [browser] 拦截 api.bilibili.com/x/web-interface/search/type 响应
-        → [platform] 解析 JSON → []Video + PageInfo
+        → [browser] 等待页面加载完成
+        → [browser] 通过 page.Eval() 提取 window.__pinia.searchTypeResponse.searchTypeResponse
+        → [platform] 解析 Pinia SSR JSON（结构同 SearchData）→ []Video + PageInfo
       → 编排层并发调度多页（pool.Run）
       → 去重 → 写 video CSV + intermediate JSON
+  
+  实测结果（2026-03-27，关键词"生化危机9"）：
+    - 24 页全部成功，0 失败
+    - 1008 条视频，492 个独立作者
+    - 总耗时 2 分 11 秒（每页约 5-6 秒）
 
 Stage 1（博主详情）:
   cmd/main.go
@@ -426,9 +435,9 @@ type BiliBrowserSearchCrawler struct {
 // NewSearchCrawler creates a new BiliBrowserSearchCrawler.
 func NewSearchCrawler(manager *browser.Manager) *BiliBrowserSearchCrawler
 
-// SearchPage opens Bilibili search page and intercepts the search API response.
+// SearchPage opens Bilibili search page and extracts search results from Pinia SSR data.
 // URL: https://search.bilibili.com/video?keyword={keyword}&page={page}
-// Intercepts: api.bilibili.com/x/web-interface/search/type
+// Data source: window.__pinia.searchTypeResponse.searchTypeResponse (SSR, same structure as SearchData)
 func (c *BiliBrowserSearchCrawler) SearchPage(ctx context.Context, keyword string, page int) ([]src.Video, src.PageInfo, error)
 ```
 
@@ -443,7 +452,7 @@ func NewAuthorCrawler(manager *browser.Manager) *BiliBrowserAuthorCrawler
 
 // FetchAuthorInfo opens the author's space page and intercepts user info + stat APIs.
 // URL: https://space.bilibili.com/{mid}
-// Intercepts: api.bilibili.com/x/space/acc/info + api.bilibili.com/x/relation/stat
+// Intercepts: api.bilibili.com/x/space/wbi/acc/info + api.bilibili.com/x/relation/stat
 func (c *BiliBrowserAuthorCrawler) FetchAuthorInfo(ctx context.Context, mid string) (*src.AuthorInfo, error)
 
 // FetchAuthorVideos opens the author's video tab and intercepts the video list API.
@@ -457,9 +466,10 @@ func (c *BiliBrowserAuthorCrawler) FetchAuthorVideos(ctx context.Context, mid st
 | 决策 | 理由 |
 |------|------|
 | 每次 `SearchPage`/`FetchAuthorInfo`/`FetchAuthorVideos` 调用都从 Page 池借用一个 Page | 与编排层的并发模型对齐：Pool 的每个 worker 调用一次接口方法，方法内部借用 Page、完成后归还 |
+| `SearchPage` 使用 SSR 提取而非 API 拦截 | B 站搜索页是 SSR 渲染（Vue 3 + Pinia），搜索结果嵌入在 `window.__pinia` 中，不发起 XHR/Fetch 请求，API 拦截策略无效 |
 | `FetchAuthorInfo` 一次导航拦截两个 API（user info + stat） | 打开博主主页时，页面 JS 会同时请求这两个 API，一次导航即可拿到全部数据，无需两次导航 |
-| `FetchAuthorVideos` 翻页通过 URL 参数而非模拟点击 | B 站博主视频列表支持 URL 参数翻页（`?pn=N`），直接导航到目标页比模拟点击更可靠、更快 |
-| types.go 从 deprecated 迁移 | API 响应的 JSON 结构不变（浏览器拦截到的就是同一个 API 的响应），类型定义完全复用 |
+| `FetchAuthorVideos` 翻页通过点击"下一页"按钮 | **实测发现**：B 站博主页为 SPA，URL 参数 `?pn=N` 不影响 API 请求的 pn 值；需通过点击翻页按钮触发新的 API 请求 |
+| types.go 从 deprecated 迁移 | API 响应的 JSON 结构不变（Pinia SSR 数据 / 浏览器拦截到的 API 响应），类型定义完全复用 |
 
 ##### src/config/config.go — 配置修改
 
@@ -523,6 +533,7 @@ func main() {
 | `browser.Manager` | `browser` | 浏览器生命周期 + Page 池管理 |
 | `browser.InterceptRule` | `browser` | 定义 URL 拦截规则 |
 | `browser.NavigateAndIntercept()` | `browser` | 导航+拦截一体化 |
+| `browser.NavigateAndExtract()` | `browser` | 导航+SSR 数据提取（用于 SSR 页面） |
 | `browser.WaitForIntercept()` | `browser` | 已加载页面的拦截等待 |
 | `browser.LoginChecker` | `browser` | 平台特定的登录检测函数 |
 | `browser.EnsureLogin()` | `browser` | 登录态保障策略 |
@@ -551,7 +562,7 @@ func main() {
 | `UserStatResp` / `UserStatData` | 同上 | 同上 | 粉丝统计 API JSON 结构 |
 | `VideoListResp` / `VideoListData` / `VideoListItems` / `VideoListItem` / `VideoListPage` | 同上 | 同上 | 视频列表 API JSON 结构 |
 
-**说明**：浏览器拦截到的 API 响应 JSON 与 API 直调完全相同（同一个后端接口），因此类型定义可以直接复用。
+**说明**：浏览器拦截到的 API 响应 JSON 与 API 直调完全相同（同一个后端接口），因此类型定义可以直接复用。对于 SSR 页面（如搜索页），Pinia 状态中的数据结构与 API 响应的 `data` 字段一致，同样复用相同类型。
 
 ##### 新增的类型
 
@@ -560,6 +571,7 @@ func main() {
 | `browser.Config` | `src/browser/browser.go` | 浏览器配置（从 config 传入） |
 | `browser.InterceptRule` | `src/browser/interceptor.go` | URL 拦截规则 |
 | `browser.InterceptResult` | `src/browser/interceptor.go` | 拦截结果 |
+| `browser.NavigateAndExtract()` | `src/browser/extractor.go` | SSR 数据提取函数 |
 | `config.BrowserConfig` | `src/config/config.go` | YAML 配置映射 |
 
 #### 4.2.4 并发模型
@@ -572,9 +584,9 @@ main goroutine
   ├── browser.Manager (管理 1 个 Chromium 进程 + N 个 Page)
   │
   ├── RunStage0 → pool.Run(concurrency=N, tasks=pages)
-  │     ├── worker-1: GetPage() → NavigateAndIntercept() → PutPage()
-  │     ├── worker-2: GetPage() → NavigateAndIntercept() → PutPage()
-  │     └── worker-N: GetPage() → NavigateAndIntercept() → PutPage()
+  │     ├── worker-1: GetPage() → NavigateAndExtract() → PutPage()  (SSR 提取)
+  │     ├── worker-2: GetPage() → NavigateAndExtract() → PutPage()  (SSR 提取)
+  │     └── worker-N: GetPage() → NavigateAndExtract() → PutPage()  (SSR 提取)
   │
   └── RunStage1 → pool.Run(concurrency=N, tasks=mids)
         ├── worker-1: GetPage() → FetchAuthorInfo() → FetchAuthorVideos(page=1..M) → PutPage()
@@ -691,11 +703,34 @@ func buildLauncher(cfg Config) *launcher.Launcher {
 }
 ```
 
-#### 4.3.2 网络请求拦截（interceptor.go）
+#### 4.3.2 网络请求拦截（interceptor.go）与 SSR 数据提取（extractor.go）
 
-##### 核心机制：基于 CDP 网络事件
+##### 核心机制：双模式数据获取
 
-使用 Rod 的 `proto.NetworkResponseReceived` 事件被动监听网络响应，而非 `HijackRequests`（后者会修改请求流，可能触发反爬检测）。
+根据页面渲染方式的不同，采用两种数据获取策略：
+
+| 策略 | 适用场景 | 实现文件 | 实测状态 |
+|--------|----------|----------|----------|
+| **SSR 数据提取** | 服务端渲染页面（如 B 站搜索页） | `extractor.go` | ✅ Stage 0 已验证 |
+| **API 拦截** | 客户端渲染页面（如 B 站博主主页） | `interceptor.go` | ❓ Stage 1 待验证 |
+
+##### SSR 数据提取（extractor.go）
+
+用于服务端渲染（SSR）页面。页面数据嵌入在 HTML 中的全局 JS 变量中，无需等待 API 请求。
+
+```
+NavigateAndExtract(ctx, page, targetURL, jsExpr) →
+  1. page.Navigate(targetURL)
+  2. page.WaitLoad()  // 等待页面加载完成
+  3. result := page.Eval(jsExpr)  // 执行 JS 提取全局变量
+  4. 返回 result 字符串（通常是 JSON）
+```
+
+**关键发现（实测验证）**：B 站搜索页使用 Vue 3 + Pinia 状态管理，搜索结果数据存储在 `window.__pinia.searchTypeResponse.searchTypeResponse` 中，结构与 `SearchData` 类型完全一致。页面不会发起 `/x/web-interface/search/type` 的 XHR/Fetch 请求，因此 API 拦截策略对搜索页无效。
+
+##### API 拦截（interceptor.go）
+
+用于客户端渲染页面。使用 Rod 的 `proto.NetworkResponseReceived` 事件被动监听网络响应，而非 `HijackRequests`（后者会修改请求流，可能触发反爬检测）。
 
 ##### NavigateAndIntercept 流程
 
@@ -798,23 +833,29 @@ func InjectCookie(page *rod.Page, domain string, cookieStr string) error {
 
 ##### SearchPage 核心流程
 
+> **实测结论**：B 站搜索页是 SSR 渲染（Vue 3 + Pinia），搜索结果数据嵌入在 `window.__pinia` 中，
+> 不会发起 `/x/web-interface/search/type` 的 XHR 请求。因此采用 SSR 数据提取策略而非 API 拦截。
+
 ```
 SearchPage(ctx, keyword, page) →
   1. mgr.GetPage() 借用一个浏览器 Page
   2. defer mgr.PutPage(page)
   3. 构造 URL: https://search.bilibili.com/video?keyword={keyword}&page={page}
-  4. 定义拦截规则:
-     rules := []InterceptRule{{
-         URLPattern: "/x/web-interface/search/type",
-         ID:         "search",
-     }}
-  5. results, err := NavigateAndIntercept(ctx, page, url, rules)
-  6. 从 results["search"].Body 解析 JSON → SearchResp
-  7. 转换 SearchResp.Data.Result → []Video
+  4. 定义 JS 提取表达式:
+     jsExpr: `() => {
+       const pinia = window.__pinia;
+       if (!pinia) return '';
+       const str = pinia.searchTypeResponse && pinia.searchTypeResponse.searchTypeResponse;
+       if (str) return JSON.stringify(str);
+       return '';
+     }`
+  5. rawJSON, err := NavigateAndExtract(ctx, page, url, jsExpr)
+  6. 解析 rawJSON → SearchData（Pinia 存储的直接是 SearchData 层级，无 code/message/data 外层包装）
+  7. 转换 SearchData.Result → []Video
      - stripHTMLTags(title)  // 去除 <em> 标签
      - parseDuration(duration)
      - time.Unix(pubdate, 0)
-  8. 构造 PageInfo{TotalPages, TotalCount}
+  8. 构造 PageInfo{TotalPages: data.NumPages, TotalCount: data.NumTotal}
   9. 返回 (videos, pageInfo, nil)
 ```
 
@@ -824,7 +865,7 @@ SearchPage(ctx, keyword, page) →
 RunStage0 调用链:
   pool.Run(tasks=pages, worker=func(page int) {
       searchCrawler.SearchPage(ctx, keyword, page)
-      // 内部: GetPage → Navigate → Intercept → Parse → PutPage
+      // 内部: GetPage → Navigate → Extract Pinia SSR → Parse → PutPage
   })
 ```
 
@@ -841,7 +882,7 @@ FetchAuthorInfo(ctx, mid) →
   3. 构造 URL: https://space.bilibili.com/{mid}
   4. 定义拦截规则（一次导航拦截两个 API）:
      rules := []InterceptRule{
-         {URLPattern: "/x/space/acc/info", ID: "user_info"},
+         {URLPattern: "/x/space/wbi/acc/info", ID: "user_info"},
          {URLPattern: "/x/relation/stat",  ID: "user_stat"},
      }
   5. results, err := NavigateAndIntercept(ctx, page, url, rules)
@@ -860,17 +901,23 @@ FetchAuthorInfo(ctx, mid) →
 FetchAuthorVideos(ctx, mid, page) →
   1. mgr.GetPage() 借用一个浏览器 Page
   2. defer mgr.PutPage(page)
-  3. 构造 URL: https://space.bilibili.com/{mid}/video?pn={page}
-     （B 站博主视频列表支持 URL 参数翻页）
+  3. 构造 URL: https://space.bilibili.com/{mid}/video
+     （**实测发现**：B 站博主页为 SPA，URL 参数 `?pn=N` 不影响 API 请求的 pn 值）
   4. 定义拦截规则:
      rules := []InterceptRule{{
          URLPattern: "/x/space/wbi/arc/search",
          ID:         "video_list",
      }}
-  5. results, err := NavigateAndIntercept(ctx, page, url, rules)
+  5. 如果 page == 1:
+       results, err := NavigateAndIntercept(ctx, page, url, rules)
+     如果 page > 1:
+       先设置拦截监听，然后点击"下一页"按钮触发新的 API 请求
+       resultCh, cancel := WaitForIntercept(ctx, page, rules)
+       page.MustElement(".be-pager-next").MustClick()
+       result := <-resultCh
   6. 解析 results["video_list"].Body → VideoListResp
   7. 转换 VideoListResp.Data.List.Vlist → []VideoDetail
-  8. 计算 PageInfo（totalPages = ceil(count / pageSize)）
+  8. 从 API 响应中读取实际的 ps 值计算 PageInfo（totalPages = ceil(count / ps)）
   9. 返回 (videos, pageInfo, nil)
 ```
 
@@ -1116,5 +1163,7 @@ cookie: ""  # 格式: "SESSDATA=xxx; bili_jct=xxx; ..."
 | 2026-03-27 | 完成 §4.3 核心逻辑实现 + §4.4 方案优劣分析 | AI |
 | 2026-03-27 | 完成 §5 备选方案 + §6 业界调研 + §7 测试计划 + §8 可观测性 & 运维 | AI |
 | 2026-03-27 | AI 评审修复：统一 §6.2 拦截方式描述与 §4.3.2 一致；修正 §7.1 单元测试模块名；§4.4 补充 Chromium 下载/磁盘增长/JS 渲染失败风险；§8.1 日志格式改为复用现有 log.Printf；§4.3.5 标注 Page 复用优化点 | AI |
+| 2026-03-27 | Stage 0 实测成功：发现 B 站搜索页为 SSR 渲染（Vue 3 + Pinia），API 拦截策略无效；改为从 `window.__pinia` 提取 SSR 数据；新增 `extractor.go`、`logger.go`；更新 §2/§3/§4 相关描述。实测结果：24 页全部成功，1008 条视频，492 个作者，耗时 2m11s | AI |
+| 2026-03-27 | Stage 1 实测修正：(1) `/x/space/acc/info` 实际为 `/x/space/wbi/acc/info`；(2) B 站博主页为 SPA，URL 参数 `?pn=N` 翻页无效，改为点击"下一页"按钮触发 API 请求；(3) videoPageSize 应从 API 响应动态读取而非硬编码。更新 §3/§4.2/§4.3 相关描述 | AI |
 
 ## 10. 参考资料 (References)

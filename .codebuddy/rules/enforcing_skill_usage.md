@@ -11,6 +11,9 @@ alwaysApply: true
 
 - Workflow 顺序：requirements-clarification → system-design → code-generation → test-generation → code-review → code-submission
 - **路由决策**：收到用户需求后，按以下优先级判断入口 skill：
+  0. **关键词触发**：
+     - 用户提及"探针反馈开发方法"、"探测反馈开发方法"或"数据驱动开发方法" → 调用 `probe-driven-development`，按探测→观察→编码流程执行
+     - 用户提及"反馈开发方法" → 调用 `feedback-driven-development`，按修改→编译→运行→分析的迭代循环执行
   1. **需求是否清晰？** → 如果需求模糊（术语不明确、目标不清晰、涉及范围不确定），无论是否涉及代码修改，都**必须先调用 `workflow-requirements-clarification`**
   2. **需求清晰 + 涉及代码修改** → 调用 `workflow-code-generation`，它会评估复杂度并在 spec 缺失时引导回 `workflow-requirements-clarification`
   3. **需求清晰 + 不涉及代码修改** → 直接回答或调用对应 workflow

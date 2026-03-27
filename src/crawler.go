@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -14,7 +13,7 @@ import (
 )
 
 // PageInfo carries pagination metadata returned by API responses.
-// Avoids a separate TotalPages() method — the first SearchPage/FetchAuthorVideos
+// Avoids a separate TotalPages() method — the first SearchPage/FetchAllAuthorVideos
 // call naturally returns this info as part of the response.
 type PageInfo struct {
 	TotalPages int // total pages available
@@ -44,11 +43,11 @@ type AuthorCrawler interface {
 	// FetchAuthorInfo fetches basic author info (name, followers, region, etc.).
 	FetchAuthorInfo(ctx context.Context, mid string) (*AuthorInfo, error)
 
-	// FetchAuthorVideos fetches a single page of the author's video list.
-	// Returns video details and pagination info.
-	// The caller uses PageInfo.TotalPages (from the first call) to decide how many
-	// pages to fetch (capped by config.max_video_per_author / page_size).
-	FetchAuthorVideos(ctx context.Context, mid string, page int) ([]VideoDetail, PageInfo, error)
+	// FetchAllAuthorVideos navigates to the author's video page and fetches all videos
+	// by paginating from page 1 to the last page (or until maxVideos is reached).
+	// Internally handles pagination (e.g. clicking "next page" in SPA) within a single
+	// browser tab, avoiding repeated navigation.
+	FetchAllAuthorVideos(ctx context.Context, mid string, maxVideos int) ([]VideoDetail, PageInfo, error)
 }
 
 // RunStage0 orchestrates stage 0: search → paginate → collect → deduplicate → export CSV.
@@ -236,52 +235,16 @@ func processOneAuthor(ctx context.Context, ac AuthorCrawler, mid AuthorMid, cfg 
 		time.Sleep(pool.JitteredDuration(cfg.RequestInterval))
 	}
 
-	// Step 2: Fetch first page of videos.
-	firstVideos, pageInfo, err := ac.FetchAuthorVideos(ctx, mid.ID, 1)
+	// Step 2: Fetch all videos (internally paginates from page 1 to last page).
+	allVideos, pageInfo, err := ac.FetchAllAuthorVideos(ctx, mid.ID, cfg.MaxVideoPerAuthor)
 	if err != nil {
-		return Author{}, fmt.Errorf("fetch author videos page 1: %w", err)
+		return Author{}, fmt.Errorf("fetch author videos: %w", err)
 	}
 
-	// Step 3: Calculate total pages to fetch.
-	maxPages := 1
-	if cfg.VideoPageSize > 0 {
-		maxPages = int(math.Ceil(float64(cfg.MaxVideoPerAuthor) / float64(cfg.VideoPageSize)))
-	}
-	actualPages := pageInfo.TotalPages
-	if actualPages > maxPages {
-		actualPages = maxPages
-	}
-
-	// Step 4: Fetch remaining pages sequentially (within a single author).
-	allVideos := make([]VideoDetail, 0, len(firstVideos)*actualPages)
-	allVideos = append(allVideos, firstVideos...)
-
-	for p := 2; p <= actualPages; p++ {
-		if ctx.Err() != nil {
-			return Author{}, ctx.Err()
-		}
-		// Brief pause between page requests with jitter to avoid fixed-rhythm detection.
-		if cfg.RequestInterval > 0 {
-			time.Sleep(pool.JitteredDuration(cfg.RequestInterval))
-		}
-		videos, _, err := ac.FetchAuthorVideos(ctx, mid.ID, p)
-		if err != nil {
-			log.Printf("WARN: Failed to fetch videos for %s page %d: %v", mid.Name, p, err)
-			break // Stop fetching more pages for this author on error.
-		}
-		allVideos = append(allVideos, videos...)
-
-		// Cap at max videos.
-		if len(allVideos) >= cfg.MaxVideoPerAuthor {
-			allVideos = allVideos[:cfg.MaxVideoPerAuthor]
-			break
-		}
-	}
-
-	// Step 5: Calculate stats.
+	// Step 3: Calculate stats.
 	stats, topVideos := cfg.CalcAuthorStats(allVideos, 3)
 
-	// Step 6: Detect language from video titles.
+	// Step 4: Detect language from video titles.
 	titles := make([]string, len(allVideos))
 	for i, v := range allVideos {
 		titles[i] = v.Title

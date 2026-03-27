@@ -34,6 +34,7 @@ const (
 type BrowserConfig struct {
 	Headless    *bool  `yaml:"headless"`      // headless mode (default true, use pointer to distinguish unset from false)
 	UserDataDir string `yaml:"user_data_dir"` // browser profile directory for login persistence
+	Bin         string `yaml:"bin"`           // custom browser binary path (skip auto-download if set)
 }
 
 // IsHeadless returns the effective headless value (defaults to true if not set).

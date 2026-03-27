@@ -3,17 +3,46 @@ package browser
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
 )
 
+// stealthJS is injected into every new Page to hide headless/webdriver fingerprints.
+// This prevents sites (e.g. Bilibili) from detecting automation and blocking requests.
+const stealthJS = `() => {
+	// Hide navigator.webdriver flag.
+	Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+	// Fake plugins array (headless has 0 plugins).
+	Object.defineProperty(navigator, 'plugins', {
+		get: () => [1, 2, 3, 4, 5],
+	});
+
+	// Fake languages.
+	Object.defineProperty(navigator, 'languages', {
+		get: () => ['zh-CN', 'zh', 'en'],
+	});
+
+	// Remove Chrome DevTools protocol detection.
+	window.chrome = { runtime: {} };
+
+	// Override permissions query to hide "denied" notification state.
+	const originalQuery = window.navigator.permissions.query;
+	window.navigator.permissions.query = (parameters) =>
+		parameters.name === 'notifications'
+			? Promise.resolve({ state: Notification.permission })
+			: originalQuery(parameters);
+}`
+
 // Config holds browser-related configuration (from config.yaml browser block).
 type Config struct {
 	Headless    bool   // headless mode (default true)
 	UserDataDir string // user data directory for login persistence
 	Concurrency int    // number of Pages to create (= pool size)
+	BrowserBin  string // custom browser binary path (skip auto-download if set)
 }
 
 // Manager manages a single Browser process and a pool of reusable Pages.
@@ -58,6 +87,10 @@ func New(cfg Config) (*Manager, error) {
 			browser.Close()
 			return nil, fmt.Errorf("create page %d: %w", i, err)
 		}
+		// Inject stealth JS to hide headless fingerprints before any navigation.
+		if _, err := page.EvalOnNewDocument(stealthJS); err != nil {
+			log.Printf("WARN: [browser] failed to inject stealth JS on page %d: %v", i, err)
+		}
 		pagePool <- page
 	}
 
@@ -80,11 +113,13 @@ func (m *Manager) GetPage() *rod.Page {
 // Navigates the Page to about:blank to reset state before returning.
 func (m *Manager) PutPage(page *rod.Page) {
 	// Reset page state to avoid residual interceptors and JS context.
+	// We only navigate to about:blank — no need to wait for stability
+	// since about:blank is a trivial page that loads instantly.
 	if err := page.Navigate("about:blank"); err != nil {
 		log.Printf("WARN: [browser] failed to navigate page to about:blank: %v", err)
-	} else {
-		page.MustWaitStable()
 	}
+	// Brief sleep to allow the navigation to take effect and clear event listeners.
+	time.Sleep(200 * time.Millisecond)
 	m.pagePool <- page
 }
 
@@ -123,7 +158,15 @@ func buildLauncher(cfg Config) *launcher.Launcher {
 		Set("disable-dev-shm-usage"). // Docker/low-memory environments
 		Set("no-sandbox").            // Linux server environments
 		Set("disable-background-networking").
-		Set("disable-extensions")
+		Set("disable-extensions").
+		Set("disable-blink-features", "AutomationControlled"). // Hide webdriver flag from Blink.
+		Set("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	// Use custom browser binary if specified, skipping auto-download and validation.
+	if cfg.BrowserBin != "" {
+		l = l.Bin(cfg.BrowserBin)
+		log.Printf("INFO: [browser] Using custom browser binary: %s", cfg.BrowserBin)
+	}
 
 	return l
 }

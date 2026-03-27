@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
@@ -29,17 +30,36 @@ type InterceptResult struct {
 	URL  string // full request URL (for debugging)
 }
 
+// defaultInterceptTimeout is the maximum time to wait for all intercept rules to match.
+// This prevents infinite blocking when the target API is not triggered (e.g., captcha page,
+// page load failure, JS execution error).
+const defaultInterceptTimeout = 30 * time.Second
+
+// debugNetworkLog controls whether all network response URLs are logged to the debug log file.
+// Enable this to diagnose why expected API calls are not being triggered.
+// Debug messages go to the file logger (see logger.go), not stdout.
+var debugNetworkLog = true
+
 // NavigateAndIntercept opens a URL in the given Page and waits for all specified
 // rules to be matched (or context timeout/cancellation).
 //
 // Flow:
 //  1. Enable network domain and set up event listener
 //  2. Navigate the Page to targetURL
-//  3. Wait until all rules have captured a response, or ctx expires
+//  3. Wait until all rules have captured a response, or ctx/timeout expires
 //  4. Return captured results
+//
+// If the caller's ctx has no deadline, a default timeout of 30s is applied.
 func NavigateAndIntercept(ctx context.Context, page *rod.Page, targetURL string, rules []InterceptRule) ([]InterceptResult, error) {
 	if len(rules) == 0 {
 		return nil, fmt.Errorf("no intercept rules provided")
+	}
+
+	// Apply default timeout if the caller's context has no deadline.
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultInterceptTimeout)
+		defer cancel()
 	}
 
 	// Enable network domain to receive events.
@@ -51,8 +71,21 @@ func NavigateAndIntercept(ctx context.Context, page *rod.Page, targetURL string,
 	// Set up event listener BEFORE navigating.
 	// EachEvent returns a wait function that blocks until the callback returns true.
 	wait := page.EachEvent(func(e *proto.NetworkResponseReceived) bool {
+		// Debug: log every network response to the file logger (not stdout).
+		if debugNetworkLog {
+			logDebug("DEBUG: [browser] network response: status=%d type=%s url=%s",
+				e.Response.Status, string(e.Type), e.Response.URL)
+		}
+
 		for _, rule := range rules {
 			if strings.Contains(e.Response.URL, rule.URLPattern) {
+				// Only capture 2xx responses. Non-2xx (e.g. 412 risk control) returns
+				// HTML error pages that would fail JSON parsing downstream.
+				if e.Response.Status < 200 || e.Response.Status >= 300 {
+					log.Printf("WARN: [browser] skipping non-2xx response for %s (status=%d, url=%s)", rule.ID, e.Response.Status, e.Response.URL)
+					continue
+				}
+
 				mu.Lock()
 				// Only capture the first match for each rule.
 				if _, exists := results[rule.ID]; !exists {
@@ -67,7 +100,13 @@ func NavigateAndIntercept(ctx context.Context, page *rod.Page, targetURL string,
 						Body: body,
 						URL:  e.Response.URL,
 					}
-					log.Printf("INFO: [browser] intercepted %s: %s", rule.ID, e.Response.URL)
+					// Log a preview of the response body for debugging.
+					preview := string(body)
+					if len(preview) > 300 {
+						preview = preview[:300] + "..."
+					}
+					log.Printf("INFO: [browser] intercepted %s (%d bytes): %s", rule.ID, len(body), e.Response.URL)
+					log.Printf("DEBUG: [browser] %s body preview: %s", rule.ID, preview)
 
 					if len(results) == len(rules) {
 						mu.Unlock()
@@ -80,14 +119,19 @@ func NavigateAndIntercept(ctx context.Context, page *rod.Page, targetURL string,
 		return false // continue listening
 	})
 
-	// Navigate to the target URL.
-	if err := page.Navigate(targetURL); err != nil {
-		return nil, fmt.Errorf("navigate to %s: %w", targetURL, err)
-	}
+	// Navigate and wait for intercept — all in a goroutine so ctx timeout covers everything.
+	log.Printf("INFO: [browser] navigating to %s", targetURL)
 
-	// Wait for all rules to match in a separate goroutine so we can respect ctx.
 	doneCh := make(chan struct{})
+	errCh := make(chan error, 1)
 	go func() {
+		if err := page.Navigate(targetURL); err != nil {
+			errCh <- fmt.Errorf("navigate to %s: %w", targetURL, err)
+			return
+		}
+		log.Printf("INFO: [browser] navigate done, waiting for API intercept: %s", targetURL)
+
+		// Wait for all intercept rules to match.
 		wait()
 		close(doneCh)
 	}()
@@ -95,8 +139,16 @@ func NavigateAndIntercept(ctx context.Context, page *rod.Page, targetURL string,
 	select {
 	case <-doneCh:
 		// All rules matched.
+		log.Printf("INFO: [browser] all intercept rules matched for %s", targetURL)
+	case err := <-errCh:
+		// Navigate or other fatal error in the goroutine.
+		return nil, err
 	case <-ctx.Done():
-		return nil, fmt.Errorf("intercept timeout for %s: %w", targetURL, ctx.Err())
+		// Collect partial results for debugging.
+		mu.Lock()
+		matched := len(results)
+		mu.Unlock()
+		return nil, fmt.Errorf("intercept timeout for %s (matched %d/%d rules): %w", targetURL, matched, len(rules), ctx.Err())
 	}
 
 	// Collect results in rule order.
@@ -139,6 +191,13 @@ func WaitForIntercept(ctx context.Context, page *rod.Page, rules []InterceptRule
 	wait := page.EachEvent(func(e *proto.NetworkResponseReceived) bool {
 		for _, rule := range rules {
 			if strings.Contains(e.Response.URL, rule.URLPattern) {
+				// Only capture 2xx responses. Non-2xx (e.g. 412 risk control) returns
+				// HTML error pages that would fail JSON parsing downstream.
+				if e.Response.Status < 200 || e.Response.Status >= 300 {
+					log.Printf("WARN: [browser] skipping non-2xx response for %s (status=%d, url=%s)", rule.ID, e.Response.Status, e.Response.URL)
+					continue
+				}
+
 				mu.Lock()
 				if _, exists := results[rule.ID]; !exists {
 					body, err := getResponseBody(page, e.RequestID)
@@ -152,6 +211,7 @@ func WaitForIntercept(ctx context.Context, page *rod.Page, rules []InterceptRule
 						Body: body,
 						URL:  e.Response.URL,
 					}
+					log.Printf("INFO: [browser] WaitForIntercept matched %s (%d bytes): %s", rule.ID, len(body), e.Response.URL)
 
 					if len(results) == len(rules) {
 						mu.Unlock()
@@ -192,11 +252,20 @@ func WaitForIntercept(ctx context.Context, page *rod.Page, rules []InterceptRule
 }
 
 // getResponseBody retrieves the response body for a given request ID via CDP.
+// Retries a few times with short delays, because the response body may not be
+// immediately available when the NetworkResponseReceived event fires.
 func getResponseBody(page *rod.Page, requestID proto.NetworkRequestID) ([]byte, error) {
-	req := proto.NetworkGetResponseBody{RequestID: requestID}
-	result, err := req.Call(page)
-	if err != nil {
-		return nil, fmt.Errorf("get response body: %w", err)
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		if i > 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
+		req := proto.NetworkGetResponseBody{RequestID: requestID}
+		result, err := req.Call(page)
+		if err == nil {
+			return []byte(result.Body), nil
+		}
+		lastErr = err
 	}
-	return []byte(result.Body), nil
+	return nil, fmt.Errorf("get response body: %w", lastErr)
 }

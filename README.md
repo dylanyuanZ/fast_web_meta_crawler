@@ -16,17 +16,21 @@ Currently supported platforms: **Bilibili** (YouTube, Instagram, etc. planned).
 ## Project Structure
 
 ```
-├── cmd/crawler/       # Entry point (main.go)
-├── src/               # Core source code
-│   ├── platform/      #   Platform-specific crawlers (e.g. bilibili/)
-│   ├── config/        #   Configuration loading
-│   ├── export/        #   CSV export
-│   ├── httpclient/    #   HTTP client with retry
-│   ├── pool/          #   Worker pool
-│   ├── progress/      #   Checkpoint / resume
-│   └── stats/         #   Statistics & language detection
-├── conf/              # Configuration files (config.yaml)
-├── doc/               # Design documents
+├── cmd/                # CLI entry points
+│   ├── crawler/        #   Main crawler binary (search + author details)
+│   └── probe/          #   Network probe tool (dump API responses for a given author mid)
+├── src/                # Core source code
+│   ├── browser/        #   Browser automation (rod-based): page pool, auth/login, network interceptor, SSR extractor
+│   ├── platform/       #   Platform-specific crawlers (e.g. bilibili/)
+│   ├── config/         #   Configuration loading (YAML)
+│   ├── export/         #   CSV export
+│   ├── pool/           #   Generic concurrent worker pool
+│   ├── progress/       #   Checkpoint / resume for interrupted tasks
+│   ├── stats/          #   Statistics & language detection
+│   └── test/           #   Integration & unit tests
+├── conf/               # Configuration files (config.yaml.example)
+├── doc/                # Design documents, specs, and technical analysis
+├── deprecated/         # (Deprecated) Old HTTP API direct-call implementation, kept for reference only
 └── go.mod
 ```
 

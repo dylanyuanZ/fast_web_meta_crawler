@@ -25,50 +25,55 @@ func NewSearchCrawler(manager *browser.Manager) *BiliBrowserSearchCrawler {
 	return &BiliBrowserSearchCrawler{manager: manager}
 }
 
-// SearchPage opens Bilibili search page and intercepts the search API response.
+// ssrExtractJS is the JS expression to extract search result data from Bilibili's
+// SSR search page. Bilibili uses Pinia (Vue 3 state management) to store SSR data
+// in window.__pinia. The search results are in __pinia.searchTypeResponse.searchTypeResponse.
+const ssrExtractJS = `() => {
+	const pinia = window.__pinia;
+	if (!pinia) return '';
+
+	// The search type response contains the actual search results.
+	const str = pinia.searchTypeResponse && pinia.searchTypeResponse.searchTypeResponse;
+	if (str) {
+		return JSON.stringify(str);
+	}
+
+	// Fallback: return the full pinia state for debugging.
+	return JSON.stringify({ _source: '__pinia_debug', _keys: Object.keys(pinia) });
+}`
+
+// SearchPage opens Bilibili search page and extracts search results from Pinia SSR data.
+// Bilibili search pages are server-side rendered — the search result data is embedded
+// in the HTML via window.__pinia (Vue 3 Pinia state), not fetched via a separate API call.
+// The data structure in Pinia is identical to the SearchData type (same as the API response's data field).
+//
 // URL: https://search.bilibili.com/video?keyword={keyword}&page={page}
-// Intercepts: api.bilibili.com/x/web-interface/search/type
 func (c *BiliBrowserSearchCrawler) SearchPage(ctx context.Context, keyword string, page int) ([]src.Video, src.PageInfo, error) {
 	p := c.manager.GetPage()
 	defer c.manager.PutPage(p)
 
 	targetURL := fmt.Sprintf("https://search.bilibili.com/video?keyword=%s&page=%d", keyword, page)
 
-	rules := []browser.InterceptRule{{
-		URLPattern: "/x/web-interface/search/type",
-		ID:         "search",
-	}}
-
-	results, err := browser.NavigateAndIntercept(ctx, p, targetURL, rules)
+	// Extract SSR data from Pinia state.
+	rawJSON, err := browser.NavigateAndExtract(ctx, p, targetURL, ssrExtractJS)
 	if err != nil {
 		return nil, src.PageInfo{}, fmt.Errorf("search page %d: %w", page, err)
 	}
 
-	// Find the search result.
-	var searchBody []byte
-	for _, r := range results {
-		if r.ID == "search" {
-			searchBody = r.Body
-			break
-		}
-	}
-	if searchBody == nil {
-		return nil, src.PageInfo{}, fmt.Errorf("search page %d: no search API response intercepted", page)
+	// Pinia stores the search data directly as SearchData (without the code/message/data wrapper).
+	var data SearchData
+	if err := json.Unmarshal([]byte(rawJSON), &data); err != nil {
+		return nil, src.PageInfo{}, fmt.Errorf("parse SSR search data for page %d: %w", page, err)
 	}
 
-	// Parse JSON response.
-	var resp SearchResp
-	if err := json.Unmarshal(searchBody, &resp); err != nil {
-		return nil, src.PageInfo{}, fmt.Errorf("parse search response: %w", err)
-	}
-
-	if resp.Code != 0 {
-		return nil, src.PageInfo{}, fmt.Errorf("search API error (code=%d, message=%s)", resp.Code, resp.Message)
+	if len(data.Result) == 0 {
+		log.Printf("WARN: [bilibili] Search page %d: no results in SSR data", page)
+		return nil, src.PageInfo{}, nil
 	}
 
 	// Convert to common types.
-	videos := make([]src.Video, 0, len(resp.Data.Result))
-	for _, item := range resp.Data.Result {
+	videos := make([]src.Video, 0, len(data.Result))
+	for _, item := range data.Result {
 		videos = append(videos, src.Video{
 			Title:     stripHTMLTags(item.Title),
 			Author:    item.Author,
@@ -81,10 +86,10 @@ func (c *BiliBrowserSearchCrawler) SearchPage(ctx context.Context, keyword strin
 	}
 
 	pageInfo := src.PageInfo{
-		TotalPages: resp.Data.NumPages,
-		TotalCount: resp.Data.NumTotal,
+		TotalPages: data.NumPages,
+		TotalCount: data.NumTotal,
 	}
 
-	log.Printf("INFO: [bilibili] Search page %d: %d videos found", page, len(videos))
+	log.Printf("INFO: [bilibili] Search page %d: %d videos found (total pages: %d)", page, len(videos), pageInfo.TotalPages)
 	return videos, pageInfo, nil
 }
