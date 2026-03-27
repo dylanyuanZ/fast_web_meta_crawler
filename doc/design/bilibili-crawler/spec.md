@@ -126,11 +126,11 @@
 | `max_search_page` | 搜索最大翻页数 | 50 |
 | `max_video_per_author` | 每个博主最大采集视频数 | 1000 |
 | `concurrency` | 并发度 | 4 |
-| `output_dir` | CSV 输出目录 | `.data/` |
+| `output_dir` | CSV 输出目录 | `data/` |
 
 #### FR-4：CSV 输出规范
 
-- **输出目录**：由配置文件指定，默认 `.data/`
+- **输出目录**：由配置文件指定，默认 `data/`
 - **文件命名**：`{平台}_{关键词}_{日期}_{时间}.csv`，如 `bilibili_美妆_20260326_210430.csv`
 - **阶段 0 和阶段 1 各自独立输出** CSV 文件
 - **TOP 视频列**：使用 Excel `=HYPERLINK("url", "视频名")` 公式，在 Excel 中显示为可点击超链接
@@ -694,7 +694,10 @@ type RetryConfig struct {
 | 网络超时 / 连接错误 | ✅ 重试 | 临时性网络问题 |
 | 5xx | ✅ 重试 | 服务端临时错误 |
 | 429 (Too Many Requests) | ✅ 重试 | 限流，退避后可能恢复 |
-| 4xx（除 429） | ❌ 不重试 | 客户端错误，重试无意义 |
+| 412 (Precondition Failed) | ✅ 重试 | Bilibili 反爬响应，退避后可能恢复 |
+| 4xx（除 429/412） | ❌ 不重试 | 客户端错误，重试无意义 |
+
+> **实践经验**：Bilibili 在检测到异常请求时会返回 HTTP 412，这不是标准的客户端错误，而是反爬机制的一种表现。将其归类为可重试错误后，配合指数退避，大部分请求最终能成功。详见 [反爬调试笔记](./bilibili-anti-crawl-notes.md)。
 
 每次重试时输出 WARN 日志，包含：URL、状态码、第几次重试、下次等待时间。
 
@@ -1042,7 +1045,7 @@ func Clean(outputDir, platform, keyword string) error
 | 维度 | 说明 |
 |------|------|
 | **API 依赖风险** | 完全依赖 Bilibili 非官方 API（社区文档），API 可能随时变更或下线，无 SLA 保障 |
-| **无登录态** | 当前设计不携带 Cookie/Token，部分 API 可能返回受限数据（如搜索结果数量上限、用户信息不完整） |
+| **反爬风控** | 依赖 Cookie 预热和 wbi 签名应对 Bilibili 反爬，阶段 1 成功率受 IP 状态影响。详见 [反爬调试笔记](./bilibili-anti-crawl-notes.md) |
 | **语言检测精度有限** | lingua-go 基于视频标题文本检测，混合语言标题（如中英混排）可能误判；Bilibili 以中文内容为主，该字段实际区分度可能不高 |
 | **统计样本偏差** | 博主统计基于采集到的视频（受 `max_video_per_author` 限制），而非全部视频，当博主视频数远超上限时统计值可能有偏差 |
 | **磁盘 I/O 开销** | 中间数据文件 + 进度文件引入额外磁盘读写，但数据量小（JSON 文件通常 < 1MB），实际影响可忽略 |
@@ -1053,16 +1056,18 @@ func Clean(outputDir, platform, keyword string) error
 | 风险 | 概率 | 影响 | 缓解措施 |
 |------|------|------|---------|
 | Bilibili API 变更/下线 | 中 | 高（功能不可用） | API 调用集中在 `platform/bilibili/` 下，变更时只需修改该目录；关注社区 API 文档更新 |
-| IP 被限流/封禁 | 中 | 中（采集速度下降或中断） | 已有指数退避重试 + 熔断机制；可通过降低并发度缓解；后续可扩展代理 IP 池（当前非目标） |
+| IP 被限流/封禁 | 中 | 中（采集速度下降或中断） | 指数退避重试 + 熔断机制 + 请求间隔控制；可配置 Cookie 提升阈值；后续可扩展代理 IP 池 |
+| wbi 签名算法变更 | 中 | 高（阶段 1 视频列表 API 不可用） | wbi 签名逻辑集中在 `platform/bilibili/wbi.go`，变更时只需修改该文件；关注社区文档更新。详见 [反爬调试笔记](./bilibili-anti-crawl-notes.md) |
 | 搜索结果不全 | 低 | 低（数据量减少） | Bilibili 搜索 API 本身有结果上限（约 1000 条），属于平台限制，非设计缺陷 |
 | 进度文件损坏 | 极低 | 中（需重新采集） | 已采用原子写入（temp + rename）防护；最坏情况下丢失最后一个博主的进度 |
 
 #### 改进空间
 
+> 反爬策略的详细调试记录和实践经验见 [bilibili-anti-crawl-notes.md](./bilibili-anti-crawl-notes.md)。
+
 | 方向 | 说明 | 优先级 |
 |------|------|--------|
-| Cookie/登录态支持 | 携带登录 Cookie 可获取更完整的数据，解除部分 API 限制 | 高 |
-| 代理 IP 池 | 应对大规模采集时的限流问题 | 中 |
+| 代理 IP 池 | 应对大规模采集时的限流问题，在 `httpclient` 层面集成代理轮换 | 中 |
 | 多平台扩展 | 接口已预留，后续添加 YouTube、Instagram 等平台实现 | 中 |
 | 增量更新 | 基于上次采集时间，只采集新增/更新的数据 | 低 |
 | 结果缓存 | 对博主信息做本地缓存，避免短时间内重复请求同一博主 | 低 |
@@ -1337,10 +1342,10 @@ func Clean(outputDir, platform, keyword string) error
 阶段 0: 搜索完成
   - 总页数: 50, 成功: 48, 失败: 2
   - 视频数: 960, 去重博主数: 156
-  - 输出: .data/bilibili_美妆测评_20260326_210430_videos.csv
+  - 输出: data/bilibili_美妆测评_20260326_210430_videos.csv
 阶段 1: 博主详情完成
   - 总博主数: 156, 成功: 151, 失败: 5
-  - 输出: .data/bilibili_美妆测评_20260326_210430_authors.csv
+  - 输出: data/bilibili_美妆测评_20260326_210430_authors.csv
 总耗时: 12m34s
 ================================
 ```
@@ -1355,21 +1360,25 @@ max_search_page: 50          # 搜索最大翻页数（1-50）
 max_video_per_author: 1000   # 每个博主最大采集视频数
 
 # 并发配置
-concurrency: 4               # Worker Pool 并发度
+concurrency: 2               # Worker Pool 并发度
+request_interval: 1200ms     # 每个 Worker 请求间隔（防触发反爬）
 
 # HTTP 客户端配置
 http:
-  timeout: 10s               # 单次请求超时
+  timeout: 15s               # 单次请求超时
   max_retries: 3             # 最大重试次数
-  initial_delay: 1s          # 首次重试延迟
-  max_delay: 10s             # 最大重试延迟
+  initial_delay: 2s          # 首次重试延迟
+  max_delay: 15s             # 最大重试延迟
   backoff_factor: 2.0        # 退避倍数
 
 # 熔断配置
-max_consecutive_failures: 3  # 连续失败熔断阈值
+max_consecutive_failures: 10 # 连续失败熔断阈值
 
 # 输出配置
-output_dir: ".data/"         # CSV 输出目录
+output_dir: "data/"          # CSV 输出目录
+
+# Cookie 配置（可选，粘贴浏览器 Cookie 可提升阶段 1 成功率）
+# cookie: "buvid3=xxx; SESSDATA=xxx"
 ```
 
 #### 参数校验规则
@@ -1379,6 +1388,8 @@ output_dir: ".data/"         # CSV 输出目录
 | `max_search_page` | 1 ≤ x ≤ 50 | 超出范围则 clamp 到边界值，WARN 日志 |
 | `max_video_per_author` | 1 ≤ x ≤ 5000 | 同上 |
 | `concurrency` | 1 ≤ x ≤ 16 | 同上 |
+| `request_interval` | ≥ 0 | 0 表示无间隔；建议 500ms-2s |
+| `cookie` | 字符串 | 可选，为空时自动通过主页预热获取初始 Cookie |
 | `output_dir` | 目录可写 | 启动时检查，不可写则报错退出 |
 
 ## 9. Changelog
@@ -1387,6 +1398,7 @@ output_dir: ".data/"         # CSV 输出目录
 |------|----------|------|
 | 2026-03-26 | 初始创建，填写背景和目标 | User |
 | 2026-03-26 | 完成第 3 章需求细化（功能性需求 + 非功能性需求） | AI |
+| 2026-03-27 | 将 Bilibili 反爬策略调试记录迁移至独立文档 [bilibili-anti-crawl-notes.md](./bilibili-anti-crawl-notes.md)；更新配置参数表为实际调优后的推荐值 | AI |
 
 ## 10. 参考资料 (References)
 
