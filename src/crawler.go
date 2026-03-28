@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/pool"
@@ -234,9 +235,20 @@ func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 		}
 	}
 
-	// Step 3: Worker Pool — worker closure captures csvWriter for real-time CSV writing.
+	// Step 3: Create global cooldown for 412 risk control.
+	// When any worker hits 412, all workers pause to let the rate limit window pass.
+	cd := &pool.Cooldown{}
+	cfg.Cooldown = cd
+
+	// Step 4: Worker Pool — worker closure captures csvWriter for real-time CSV writing.
 	results := cfg.PoolRun(ctx, cfg.Concurrency, mids,
 		func(ctx context.Context, mid AuthorMid) (Author, error) {
+			// Wait for global cooldown before starting.
+			cd.Wait(ctx)
+			if ctx.Err() != nil {
+				return Author{}, ctx.Err()
+			}
+
 			author, err := processOneAuthor(ctx, ac, mid, cfg)
 			if err != nil {
 				return Author{}, err
@@ -272,6 +284,57 @@ func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 
 // processOneAuthor fetches all data for a single author and assembles the Author struct.
 func processOneAuthor(ctx context.Context, ac AuthorCrawler, mid AuthorMid, cfg Stage1Config) (Author, error) {
+	const maxRetries = 3
+	var lastErr error
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Trigger global cooldown so ALL workers pause, not just this one.
+			// This prevents other workers from also hitting 412 during the backoff.
+			backoff := time.Duration(10<<(attempt-1)) * time.Second
+			if cfg.Cooldown != nil {
+				cfg.Cooldown.Trigger(backoff)
+			}
+			log.Printf("WARN: Retrying author %s (mid=%s) in %v (attempt %d/%d, last error: %v)",
+				mid.Name, mid.ID, backoff, attempt, maxRetries, lastErr)
+			select {
+			case <-ctx.Done():
+				return Author{}, fmt.Errorf("context cancelled during retry backoff: %w", ctx.Err())
+			case <-time.After(backoff):
+			}
+		}
+
+		author, err := processOneAuthorOnce(ctx, ac, mid, cfg)
+		if err == nil {
+			return author, nil
+		}
+		lastErr = err
+
+		// Retry on 412 (risk control) and intercept timeout errors.
+		// During rate limiting, intercept timeouts are often caused by the same
+		// anti-crawl mechanism that produces 412 responses.
+		if !isRetryableError(err) {
+			return Author{}, err
+		}
+	}
+
+	return Author{}, fmt.Errorf("all %d retries exhausted: %w", maxRetries, lastErr)
+}
+
+// isRetryableError checks if the error is retryable.
+// Retryable errors include:
+//   - 412 risk control responses from Bilibili
+//   - Intercept timeouts (often caused by the same anti-crawl mechanism during rate limiting)
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := err.Error()
+	return strings.Contains(errMsg, "status=412") ||
+		strings.Contains(errMsg, "intercept timeout")
+}
+
+func processOneAuthorOnce(ctx context.Context, ac AuthorCrawler, mid AuthorMid, cfg Stage1Config) (Author, error) {
 	authorStart := time.Now()
 
 	// Step 1: Fetch author info.
@@ -363,6 +426,7 @@ type Stage1Config struct {
 	ExistingCSVPath        string // non-empty when resuming from a previous run
 	CalcAuthorStats        func(videos []VideoDetail, topN int) (AuthorStats, []TopVideo)
 	DetectLanguage         func(titles []string) string
+	Cooldown               *pool.Cooldown // global cooldown for 412 risk control
 }
 
 // AuthorCSVRowWriter abstracts incremental CSV writing for author data.

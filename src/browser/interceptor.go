@@ -50,6 +50,8 @@ var debugNetworkLog = true
 //  4. Return captured results
 //
 // If the caller's ctx has no deadline, a default timeout of 30s is applied.
+// Non-2xx responses (e.g. 412 risk control) cause an immediate error return
+// instead of waiting for timeout.
 func NavigateAndIntercept(ctx context.Context, page *rod.Page, targetURL string, rules []InterceptRule) ([]InterceptResult, error) {
 	if len(rules) == 0 {
 		return nil, fmt.Errorf("no intercept rules provided")
@@ -68,6 +70,9 @@ func NavigateAndIntercept(ctx context.Context, page *rod.Page, targetURL string,
 	var mu sync.Mutex
 	results := make(map[string]InterceptResult)
 
+	// Channel to signal non-2xx error (fast-fail instead of waiting for timeout).
+	non2xxErrCh := make(chan error, 1)
+
 	// Set up event listener BEFORE navigating.
 	// EachEvent returns a wait function that blocks until the callback returns true.
 	wait := page.EachEvent(func(e *proto.NetworkResponseReceived) bool {
@@ -79,11 +84,15 @@ func NavigateAndIntercept(ctx context.Context, page *rod.Page, targetURL string,
 
 		for _, rule := range rules {
 			if strings.Contains(e.Response.URL, rule.URLPattern) {
-				// Only capture 2xx responses. Non-2xx (e.g. 412 risk control) returns
-				// HTML error pages that would fail JSON parsing downstream.
+				// Non-2xx responses (e.g. 412 risk control) should cause immediate failure
+				// instead of silently waiting for a 2xx that may never come.
 				if e.Response.Status < 200 || e.Response.Status >= 300 {
-					log.Printf("WARN: [browser] skipping non-2xx response for %s (status=%d, url=%s)", rule.ID, e.Response.Status, e.Response.URL)
-					continue
+					log.Printf("WARN: [browser] non-2xx response for %s (status=%d, url=%s)", rule.ID, e.Response.Status, e.Response.URL)
+					select {
+					case non2xxErrCh <- fmt.Errorf("non-2xx response for %s (status=%d, url=%s)", rule.ID, e.Response.Status, e.Response.URL):
+					default:
+					}
+					return true // stop listening
 				}
 
 				mu.Lock()
@@ -120,12 +129,16 @@ func NavigateAndIntercept(ctx context.Context, page *rod.Page, targetURL string,
 	})
 
 	// Navigate and wait for intercept — all in a goroutine so ctx timeout covers everything.
+	// CRITICAL: Use page.Context(ctx) so Rod's Navigate respects our timeout.
+	// Without this, page.Navigate() uses page's internal context (no timeout),
+	// and if it hangs, the page is never returned to the pool.
+	p := page.Context(ctx)
 	log.Printf("INFO: [browser] navigating to %s", targetURL)
 
 	doneCh := make(chan struct{})
 	errCh := make(chan error, 1)
 	go func() {
-		if err := page.Navigate(targetURL); err != nil {
+		if err := p.Navigate(targetURL); err != nil {
 			errCh <- fmt.Errorf("navigate to %s: %w", targetURL, err)
 			return
 		}
@@ -138,7 +151,12 @@ func NavigateAndIntercept(ctx context.Context, page *rod.Page, targetURL string,
 
 	select {
 	case <-doneCh:
-		// All rules matched.
+		// All rules matched — check if it was due to a non-2xx error.
+		select {
+		case non2xxErr := <-non2xxErrCh:
+			return nil, non2xxErr
+		default:
+		}
 		log.Printf("INFO: [browser] all intercept rules matched for %s", targetURL)
 	case err := <-errCh:
 		// Navigate or other fatal error in the goroutine.
@@ -181,21 +199,38 @@ func WaitForIntercept(ctx context.Context, page *rod.Page, rules []InterceptRule
 		}
 	}
 
+	// Apply default timeout if the caller's context has no deadline.
+	// This prevents infinite blocking when the target API returns non-2xx
+	// or is never triggered.
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultInterceptTimeout)
+		// cancel will be called when the returned waitFn completes or times out.
+		_ = cancel // prevent lint warning; timeout will fire automatically
+	}
+
 	// Enable network domain to receive events.
 	_ = proto.NetworkEnable{}.Call(page)
 
 	var mu sync.Mutex
 	results := make(map[string]InterceptResult)
 
+	// Channel to signal non-2xx error (fast-fail instead of waiting for timeout).
+	non2xxErrCh := make(chan error, 1)
+
 	// Set up event listener.
 	wait := page.EachEvent(func(e *proto.NetworkResponseReceived) bool {
 		for _, rule := range rules {
 			if strings.Contains(e.Response.URL, rule.URLPattern) {
-				// Only capture 2xx responses. Non-2xx (e.g. 412 risk control) returns
-				// HTML error pages that would fail JSON parsing downstream.
+				// Non-2xx responses (e.g. 412 risk control) should cause immediate failure
+				// instead of silently waiting for a 2xx that may never come.
 				if e.Response.Status < 200 || e.Response.Status >= 300 {
-					log.Printf("WARN: [browser] skipping non-2xx response for %s (status=%d, url=%s)", rule.ID, e.Response.Status, e.Response.URL)
-					continue
+					log.Printf("WARN: [browser] non-2xx response for %s (status=%d, url=%s)", rule.ID, e.Response.Status, e.Response.URL)
+					select {
+					case non2xxErrCh <- fmt.Errorf("non-2xx response for %s (status=%d, url=%s)", rule.ID, e.Response.Status, e.Response.URL):
+					default:
+					}
+					return true // stop listening
 				}
 
 				mu.Lock()
@@ -233,7 +268,12 @@ func WaitForIntercept(ctx context.Context, page *rod.Page, rules []InterceptRule
 
 		select {
 		case <-doneCh:
-			// All rules matched.
+			// Check if it was due to a non-2xx error.
+			select {
+			case non2xxErr := <-non2xxErrCh:
+				return nil, non2xxErr
+			default:
+			}
 		case <-ctx.Done():
 			return nil, fmt.Errorf("intercept wait timeout: %w", ctx.Err())
 		}

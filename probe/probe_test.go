@@ -1,4 +1,4 @@
-package bilibili
+package probe
 
 import (
 	"context"
@@ -11,21 +11,22 @@ import (
 
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/browser"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/config"
+	"github.com/dylanyuanZ/fast_web_meta_crawler/src/platform/bilibili"
 	"github.com/go-rod/rod/lib/proto"
 )
 
 // TestProbeAuthorPage opens a real Bilibili author's space page and dumps
 // all network responses to understand what data is available and where.
-// Run with: go test -v -run TestProbeAuthorPage -timeout 120s ./src/platform/bilibili/
+// Run with: go test -v -run TestProbeAuthorPage -timeout 120s ./probe/
 func TestProbeAuthorPage(t *testing.T) {
 	// Load config for browser settings and cookie.
-	if err := config.Load("../../../conf/config.yaml"); err != nil {
+	if err := config.Load("../conf/config.yaml"); err != nil {
 		t.Fatalf("load config: %v", err)
 	}
 	cfg := config.Get()
 
 	// Init debug log.
-	browser.InitDebugLog("../../../log")
+	browser.InitDebugLog("../log")
 	defer browser.CloseDebugLog()
 
 	// Create browser manager with concurrency=1.
@@ -152,21 +153,21 @@ func TestProbeAuthorPage(t *testing.T) {
 
 	// Save summary to file.
 	summaryData, _ := json.MarshalIndent(apiResponses, "", "  ")
-	os.MkdirAll("../../../data/probe", 0o755)
-	os.WriteFile("../../../data/probe/api_responses.json", summaryData, 0o644)
+	os.MkdirAll("../data/probe", 0o755)
+	os.WriteFile("../data/probe/api_responses.json", summaryData, 0o644)
 	t.Logf("Summary saved to data/probe/api_responses.json")
 }
 
 // TestProbeStage1Quick does a quick Stage 1 test with 1 author.
-// Run with: go test -v -run TestProbeStage1Quick -timeout 120s ./src/platform/bilibili/
+// Run with: go test -v -run TestProbeStage1Quick -timeout 120s ./probe/
 func TestProbeStage1Quick(t *testing.T) {
 	// Load config.
-	if err := config.Load("../../../conf/config.yaml"); err != nil {
+	if err := config.Load("../conf/config.yaml"); err != nil {
 		t.Fatalf("load config: %v", err)
 	}
 	cfg := config.Get()
 
-	browser.InitDebugLog("../../../log")
+	browser.InitDebugLog("../log")
 	defer browser.CloseDebugLog()
 
 	mgr, err := browser.New(browser.Config{
@@ -184,12 +185,12 @@ func TestProbeStage1Quick(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	if err := browser.EnsureLogin(ctx, mgr, "https://www.bilibili.com", cfg.Cookie, BilibiliLoginChecker); err != nil {
+	if err := browser.EnsureLogin(ctx, mgr, "https://www.bilibili.com", cfg.Cookie, bilibili.BilibiliLoginChecker); err != nil {
 		t.Fatalf("ensure login: %v", err)
 	}
 
 	// Create author crawler.
-	ac := NewAuthorCrawler(mgr)
+	ac := bilibili.NewAuthorCrawler(mgr)
 
 	// Test FetchAuthorInfo.
 	mid := "314216"
@@ -217,15 +218,15 @@ func TestProbeStage1Quick(t *testing.T) {
 }
 
 // TestStage1EndToEnd tests the full Stage 1 flow with multiple authors.
-// Run with: go test -v -run TestStage1EndToEnd -timeout 300s ./src/platform/bilibili/
+// Run with: go test -v -run TestStage1EndToEnd -timeout 300s ./probe/
 func TestStage1EndToEnd(t *testing.T) {
 	// Load config.
-	if err := config.Load("../../../conf/config.yaml"); err != nil {
+	if err := config.Load("../conf/config.yaml"); err != nil {
 		t.Fatalf("load config: %v", err)
 	}
 	cfg := config.Get()
 
-	browser.InitDebugLog("../../../log")
+	browser.InitDebugLog("../log")
 	defer browser.CloseDebugLog()
 
 	mgr, err := browser.New(browser.Config{
@@ -243,18 +244,18 @@ func TestStage1EndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	if err := browser.EnsureLogin(ctx, mgr, "https://www.bilibili.com", cfg.Cookie, BilibiliLoginChecker); err != nil {
+	if err := browser.EnsureLogin(ctx, mgr, "https://www.bilibili.com", cfg.Cookie, bilibili.BilibiliLoginChecker); err != nil {
 		t.Fatalf("ensure login: %v", err)
 	}
 
-	ac := NewAuthorCrawler(mgr)
+	ac := bilibili.NewAuthorCrawler(mgr)
 
 	// Test with 3 authors from the intermediate data.
 	mids := []struct {
 		name string
 		id   string
 	}{
-		{"随义のfreely", "314216"},
+		{"随義のfreely", "314216"},
 		{"老番茄", "546195"},
 		{"影视飓风", "946974"},
 	}
@@ -285,14 +286,14 @@ func TestStage1EndToEnd(t *testing.T) {
 }
 
 // TestVerifyPagination verifies that FetchAllAuthorVideos returns multiple pages of data.
-// Run with: go test -v -run TestVerifyPagination -timeout 120s ./src/platform/bilibili/
+// Run with: go test -v -run TestVerifyPagination -timeout 120s ./probe/
 func TestVerifyPagination(t *testing.T) {
-	if err := config.Load("../../../conf/config.yaml"); err != nil {
+	if err := config.Load("../conf/config.yaml"); err != nil {
 		t.Fatalf("load config: %v", err)
 	}
 	cfg := config.Get()
 
-	browser.InitDebugLog("../../../log")
+	browser.InitDebugLog("../log")
 	defer browser.CloseDebugLog()
 
 	mgr, err := browser.New(browser.Config{
@@ -309,12 +310,12 @@ func TestVerifyPagination(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	if err := browser.EnsureLogin(ctx, mgr, "https://www.bilibili.com", cfg.Cookie, BilibiliLoginChecker); err != nil {
+	if err := browser.EnsureLogin(ctx, mgr, "https://www.bilibili.com", cfg.Cookie, bilibili.BilibiliLoginChecker); err != nil {
 		t.Fatalf("ensure login: %v", err)
 	}
 
-	ac := NewAuthorCrawler(mgr)
-	mid := "314216" // 随义のfreely, 350 videos, 9 pages
+	ac := bilibili.NewAuthorCrawler(mgr)
+	mid := "314216" // 随義のfreely, 350 videos, 9 pages
 
 	// Fetch all videos with a reasonable cap.
 	videos, pageInfo, err := ac.FetchAllAuthorVideos(ctx, mid, 200)
@@ -348,15 +349,15 @@ func TestVerifyPagination(t *testing.T) {
 //  2. "#宠物"      — with literal "#" in URL (browser may treat as fragment)
 //  3. "%23宠物"    — with URL-encoded "#" (%23)
 //
-// Run with: go test -v -run TestProbeSearchHashKeyword -timeout 120s ./src/platform/bilibili/
+// Run with: go test -v -run TestProbeSearchHashKeyword -timeout 120s ./probe/
 func TestProbeSearchHashKeyword(t *testing.T) {
 	// Load config for browser settings and cookie.
-	if err := config.Load("../../../conf/config.yaml"); err != nil {
+	if err := config.Load("../conf/config.yaml"); err != nil {
 		t.Fatalf("load config: %v", err)
 	}
 	cfg := config.Get()
 
-	browser.InitDebugLog("../../../log")
+	browser.InitDebugLog("../log")
 	defer browser.CloseDebugLog()
 
 	mgr, err := browser.New(browser.Config{
@@ -494,14 +495,14 @@ func TestProbeSearchHashKeyword(t *testing.T) {
 // This test uses the actual SearchPage method (not raw URL navigation) to confirm
 // the fix works end-to-end.
 //
-// Run with: go test -v -run TestProbeSearchSpecialChars -timeout 180s ./src/platform/bilibili/
+// Run with: go test -v -run TestProbeSearchSpecialChars -timeout 180s ./probe/
 func TestProbeSearchSpecialChars(t *testing.T) {
-	if err := config.Load("../../../conf/config.yaml"); err != nil {
+	if err := config.Load("../conf/config.yaml"); err != nil {
 		t.Fatalf("load config: %v", err)
 	}
 	cfg := config.Get()
 
-	browser.InitDebugLog("../../../log")
+	browser.InitDebugLog("../log")
 	defer browser.CloseDebugLog()
 
 	mgr, err := browser.New(browser.Config{
@@ -519,11 +520,11 @@ func TestProbeSearchSpecialChars(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	if err := browser.EnsureLogin(ctx, mgr, "https://www.bilibili.com", cfg.Cookie, BilibiliLoginChecker); err != nil {
+	if err := browser.EnsureLogin(ctx, mgr, "https://www.bilibili.com", cfg.Cookie, bilibili.BilibiliLoginChecker); err != nil {
 		t.Fatalf("ensure login: %v", err)
 	}
 
-	sc := NewSearchCrawler(mgr)
+	sc := bilibili.NewSearchCrawler(mgr)
 
 	// Test keywords with various special characters.
 	// Each entry: keyword, description, whether we expect results (true = should have results).

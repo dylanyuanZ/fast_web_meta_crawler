@@ -13,6 +13,7 @@ import (
 	"time"
 
 	src "github.com/dylanyuanZ/fast_web_meta_crawler/src"
+	"github.com/dylanyuanZ/fast_web_meta_crawler/src/applog"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/browser"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/config"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/export"
@@ -36,6 +37,12 @@ func main() {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
+
+	// Initialize global log: write all log output to both console and log/ directory.
+	if err := applog.Init("log"); err != nil {
+		log.Printf("WARN: failed to init global log: %v (logs will only go to console)", err)
+	}
+	defer applog.Close()
 
 	if *platform != "bilibili" {
 		log.Fatalf("FATAL: unsupported platform: %s (only 'bilibili' is supported)", *platform)
@@ -120,6 +127,10 @@ func main() {
 	// Create platform-specific crawlers.
 	searchCrawler := bilibili.NewSearchCrawler(mgr)
 	authorCrawler := bilibili.NewAuthorCrawler(mgr)
+	// Set pagination interval to match requestInterval so pagination clicks
+	// are rate-limited the same as inter-author requests. This prevents
+	// rapid pagination from triggering 412 rate limiting.
+	authorCrawler.SetPaginationInterval(cfg.RequestInterval)
 
 	taskStart := time.Now()
 	var mids []src.AuthorMid

@@ -3,8 +3,8 @@ max_search_page: 50          # max pages to search (1-50)
 max_video_per_author: 1000   # max videos to collect per author
 
 # Concurrency configuration
-concurrency: 3               # Worker Pool concurrency level (= browser Tab count, recommended 3-5)
-request_interval: 500ms      # Delay between requests per worker (browser mode needs less delay)
+concurrency: 2               # Worker Pool concurrency level (= browser Tab count, recommended 2; higher values may trigger 412 anti-crawl)
+request_interval: 2500ms     # Delay between requests per worker (anti-crawl safe interval)
 
 # Browser configuration
 browser:

@@ -33,24 +33,29 @@ func NavigateAndExtract(ctx context.Context, page *rod.Page, targetURL string, j
 		defer cancel()
 	}
 
+	// CRITICAL: Rod's page.Navigate/WaitLoad/Eval use page's internal context,
+	// not the ctx parameter. We must pass our timeout context to the page
+	// via page.Context(ctx) so that Rod operations respect the timeout.
+	p := page.Context(ctx)
+
 	log.Printf("INFO: [browser] navigating to %s", targetURL)
 
 	// Navigate to the target URL.
-	if err := page.Navigate(targetURL); err != nil {
+	if err := p.Navigate(targetURL); err != nil {
 		return "", fmt.Errorf("navigate to %s: %w", targetURL, err)
 	}
 
 	log.Printf("INFO: [browser] navigate done, waiting for page load: %s", targetURL)
 
 	// Wait for page to finish loading.
-	if err := page.WaitLoad(); err != nil {
+	if err := p.WaitLoad(); err != nil {
 		return "", fmt.Errorf("wait for page load %s: %w", targetURL, err)
 	}
 
 	log.Printf("INFO: [browser] page loaded: %s", targetURL)
 
 	// Execute JS to extract data from the page.
-	result, err := page.Eval(jsExpr)
+	result, err := p.Eval(jsExpr)
 	if err != nil {
 		return "", fmt.Errorf("eval JS on %s: %w", targetURL, err)
 	}

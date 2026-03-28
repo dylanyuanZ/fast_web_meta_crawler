@@ -26,10 +26,10 @@ func NewSearchCrawler(manager *browser.Manager) *BiliBrowserSearchCrawler {
 	return &BiliBrowserSearchCrawler{manager: manager}
 }
 
-// ssrExtractJS is the JS expression to extract search result data from Bilibili's
+// SSRExtractJS is the JS expression to extract search result data from Bilibili's
 // SSR search page. Bilibili uses Pinia (Vue 3 state management) to store SSR data
 // in window.__pinia. The search results are in __pinia.searchTypeResponse.searchTypeResponse.
-const ssrExtractJS = `() => {
+const SSRExtractJS = `() => {
 	const pinia = window.__pinia;
 	if (!pinia) return '';
 
@@ -56,7 +56,7 @@ func (c *BiliBrowserSearchCrawler) SearchPage(ctx context.Context, keyword strin
 	targetURL := fmt.Sprintf("https://search.bilibili.com/video?keyword=%s&page=%d", url.QueryEscape(keyword), page)
 
 	// Extract SSR data from Pinia state.
-	rawJSON, err := browser.NavigateAndExtract(ctx, p, targetURL, ssrExtractJS)
+	rawJSON, err := browser.NavigateAndExtract(ctx, p, targetURL, SSRExtractJS)
 	if err != nil {
 		return nil, src.PageInfo{}, fmt.Errorf("search page %d: %w", page, err)
 	}

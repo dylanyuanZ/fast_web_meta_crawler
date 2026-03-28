@@ -16,6 +16,43 @@ type TaskResult[T any, R any] struct {
 	Err    error // non-nil on failure
 }
 
+// Cooldown provides a global cooldown mechanism for all workers.
+// When any worker triggers a cooldown (e.g. due to 412 risk control),
+// all workers will wait until the cooldown period expires before proceeding.
+type Cooldown struct {
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+// Trigger sets a cooldown period. If a longer cooldown is already active,
+// this call is a no-op.
+func (c *Cooldown) Trigger(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	newDeadline := time.Now().Add(d)
+	if newDeadline.After(c.deadline) {
+		c.deadline = newDeadline
+		log.Printf("WARN: [pool] Global cooldown triggered: all workers pausing for %v", d)
+	}
+}
+
+// Wait blocks until the cooldown period expires or ctx is cancelled.
+// Returns immediately if no cooldown is active.
+func (c *Cooldown) Wait(ctx context.Context) {
+	c.mu.Lock()
+	remaining := time.Until(c.deadline)
+	c.mu.Unlock()
+
+	if remaining <= 0 {
+		return
+	}
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(remaining):
+	}
+}
+
 // Run starts N workers, each consuming tasks from an internal channel.
 // Returns after all tasks are processed or ctx is cancelled.
 // Every task produces a TaskResult — the caller inspects Err to separate
@@ -26,6 +63,9 @@ type TaskResult[T any, R any] struct {
 //
 // requestInterval adds a delay between consecutive requests within each worker
 // to avoid triggering anti-crawl mechanisms.
+//
+// cooldown is an optional shared Cooldown that workers can check before each task.
+// Pass nil to disable global cooldown.
 func Run[T any, R any](
 	ctx context.Context,
 	concurrency int,
@@ -33,9 +73,16 @@ func Run[T any, R any](
 	worker func(ctx context.Context, task T) (R, error),
 	maxConsecutiveFailures int,
 	requestInterval time.Duration,
+	cooldown ...*Cooldown,
 ) []TaskResult[T, R] {
 	if len(tasks) == 0 {
 		return nil
+	}
+
+	// Extract optional cooldown.
+	var cd *Cooldown
+	if len(cooldown) > 0 {
+		cd = cooldown[0]
 	}
 
 	// Create a cancellable context for circuit breaker support.
@@ -59,6 +106,14 @@ func Run[T any, R any](
 				// Check if context is cancelled before processing.
 				if ctx.Err() != nil {
 					return
+				}
+
+				// Wait for global cooldown if active.
+				if cd != nil {
+					cd.Wait(ctx)
+					if ctx.Err() != nil {
+						return
+					}
 				}
 
 				result, err := worker(ctx, task)

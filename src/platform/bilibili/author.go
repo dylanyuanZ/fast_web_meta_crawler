@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strings"
 	"time"
 
 	src "github.com/dylanyuanZ/fast_web_meta_crawler/src"
@@ -16,7 +17,8 @@ import (
 
 // BiliBrowserAuthorCrawler implements src.AuthorCrawler using browser automation.
 type BiliBrowserAuthorCrawler struct {
-	manager *browser.Manager
+	manager            *browser.Manager
+	paginationInterval time.Duration // delay between pagination clicks (defaults to defaultPaginationInterval)
 }
 
 // Compile-time interface check.
@@ -24,7 +26,10 @@ var _ src.AuthorCrawler = (*BiliBrowserAuthorCrawler)(nil)
 
 // NewAuthorCrawler creates a new BiliBrowserAuthorCrawler.
 func NewAuthorCrawler(manager *browser.Manager) *BiliBrowserAuthorCrawler {
-	return &BiliBrowserAuthorCrawler{manager: manager}
+	return &BiliBrowserAuthorCrawler{
+		manager:            manager,
+		paginationInterval: defaultPaginationInterval,
+	}
 }
 
 // FetchAuthorInfo opens the author's space page and intercepts user info + stat APIs.
@@ -95,10 +100,10 @@ func (c *BiliBrowserAuthorCrawler) FetchAuthorInfo(ctx context.Context, mid stri
 // Verified via network probe: the pagination uses Vue UI components.
 const nextPageButtonSelector = "button.vui_pagenation--btn-side:last-child"
 
-// paginationInterval is the delay between clicking "next page" buttons.
-// Slightly shorter than inter-request interval since these are lightweight UI clicks
-// within the same page, but still needed to avoid triggering SPA rate limits.
-const paginationInterval = 800 * time.Millisecond
+// defaultPaginationInterval is the delay between clicking "next page" buttons.
+// This should be close to the requestInterval to avoid triggering rate limits,
+// since each pagination click generates a real API request (arc/search).
+const defaultPaginationInterval = 800 * time.Millisecond
 
 // FetchAllAuthorVideos navigates to the author's video tab and fetches all videos
 // by paginating from page 1 to the last page (or until maxVideos is reached).
@@ -106,6 +111,12 @@ const paginationInterval = 800 * time.Millisecond
 // This approach is necessary because Bilibili's space page is a SPA — URL parameters
 // like ?pn=2 do NOT affect the API request's pn value. Pagination must be triggered
 // by clicking the UI "next page" button.
+// SetPaginationInterval sets the delay between pagination clicks.
+// This should be called before FetchAllAuthorVideos to match the requestInterval.
+func (c *BiliBrowserAuthorCrawler) SetPaginationInterval(d time.Duration) {
+	c.paginationInterval = d
+}
+
 func (c *BiliBrowserAuthorCrawler) FetchAllAuthorVideos(ctx context.Context, mid string, maxVideos int) ([]src.VideoDetail, src.PageInfo, error) {
 	p := c.manager.GetPage()
 	defer c.manager.PutPage(p)
@@ -174,7 +185,13 @@ func (c *BiliBrowserAuthorCrawler) FetchAllAuthorVideos(ctx context.Context, mid
 		}
 
 		// Brief pause between page clicks with jitter.
-		time.Sleep(pool.JitteredDuration(paginationInterval))
+		// Use the configured pagination interval (should match requestInterval)
+		// to avoid triggering rate limits from rapid pagination API calls.
+		pagInterval := c.paginationInterval
+		if pagInterval <= 0 {
+			pagInterval = defaultPaginationInterval
+		}
+		time.Sleep(pool.JitteredDuration(pagInterval))
 
 		// Set up intercept BEFORE clicking.
 		waitFn := browser.WaitForIntercept(ctx, p, rules)
@@ -196,6 +213,13 @@ func (c *BiliBrowserAuthorCrawler) FetchAllAuthorVideos(ctx context.Context, mid
 		// Wait for the new API response.
 		nextResults, err := waitFn()
 		if err != nil {
+			// If the error is a 412 (rate limit), return it as a fatal error
+			// so processOneAuthor can trigger global cooldown and retry.
+			// Previously this was just a break, silently losing data and not
+			// triggering the retry/cooldown mechanism.
+			if strings.Contains(err.Error(), "status=412") {
+				return allVideos, pageInfo, fmt.Errorf("fetch videos mid=%s: pagination page %d hit rate limit: %w", mid, currentPage, err)
+			}
 			log.Printf("WARN: [bilibili] intercept page %d mid=%s failed: %v", currentPage, mid, err)
 			break
 		}

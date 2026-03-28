@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dylanyuanZ/fast_web_meta_crawler/src/applog"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/browser"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/config"
 	"github.com/go-rod/rod/lib/proto"
@@ -25,6 +26,12 @@ func main() {
 		os.Exit(1)
 	}
 	mid := os.Args[1]
+
+	// Initialize global log: write all log output to both console and log/ directory.
+	if err := applog.Init("log"); err != nil {
+		log.Printf("WARN: failed to init global log: %v (logs will only go to console)", err)
+	}
+	defer applog.Close()
 
 	// Load config for browser settings and cookie.
 	if err := config.Load("conf/config.yaml"); err != nil {
