@@ -27,13 +27,13 @@ func main() {
 	// Parse command-line arguments.
 	platform := flag.String("platform", "", "Target platform (e.g. bilibili)")
 	keyword := flag.String("keyword", "", "Search keyword")
-	stage := flag.String("stage", "all", "Stage to run: 0, 1, or all")
+	stage := flag.String("stage", "all", "Stage to run: 0, 1, 2, or all")
 	configPath := flag.String("config", "conf/config.yaml", "Path to config file")
 	limit := flag.Int("limit", 0, "Limit number of authors to process in stage 1 (0 = no limit, for debugging)")
 	flag.Parse()
 
 	if *platform == "" || *keyword == "" {
-		fmt.Println("Usage: crawler --platform <platform> --keyword <keyword> [--stage 0|1|all] [--config path]")
+		fmt.Println("Usage: crawler --platform <platform> --keyword <keyword> [--stage 0|1|2|all] [--config path]")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
@@ -48,8 +48,8 @@ func main() {
 		log.Fatalf("FATAL: unsupported platform: %s (only 'bilibili' is supported)", *platform)
 	}
 
-	if *stage != "0" && *stage != "1" && *stage != "all" {
-		log.Fatalf("FATAL: invalid stage: %s (must be 0, 1, or all)", *stage)
+	if *stage != "0" && *stage != "1" && *stage != "2" && *stage != "all" {
+		log.Fatalf("FATAL: invalid stage: %s (must be 0, 1, 2, or all)", *stage)
 	}
 
 	// Load configuration.
@@ -60,9 +60,6 @@ func main() {
 
 	log.Printf("INFO: Configuration loaded: platform=%s, keyword=%q, stage=%s, concurrency=%d, output=%s",
 		*platform, *keyword, *stage, cfg.Concurrency, cfg.OutputDir)
-
-	// Initialize language detector.
-	stats.InitDetector()
 
 	// Setup context with signal handling for graceful shutdown.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -132,12 +129,17 @@ func main() {
 	// rapid pagination from triggering 412 rate limiting.
 	authorCrawler.SetPaginationInterval(cfg.RequestInterval)
 
+	// Create platform-specific CSV adapters.
+	authorAdapter := &bilibili.BilibiliAuthorCSVAdapter{}
+	videoAdapter := &bilibili.BilibiliVideoCSVAdapter{}
+
 	taskStart := time.Now()
 	var mids []src.AuthorMid
 
 	// Run stages.
 	runStage0 := *stage == "0" || *stage == "all"
-	runStage1 := *stage == "1" || *stage == "all"
+	runStage1 := *stage == "1"
+	runStage2 := *stage == "2" || *stage == "all"
 
 	if runStage0 && (prog.Stage == 0 || *stage == "0") {
 		// Determine if resuming with existing video CSV.
@@ -157,10 +159,11 @@ func main() {
 			Progress:               prog,
 			PoolRun:                adaptPoolRun[int, []src.Video],
 			NewVideoCSVWriter: func(outputDir, platform, keyword string) (src.VideoCSVRowWriter, error) {
-				return export.NewVideoCSVWriter(outputDir, platform, keyword)
+				return export.NewVideoCSVWriter(outputDir, platform, keyword,
+					videoAdapter.Header(), videoAdapter.Row)
 			},
 			OpenVideoCSVWriter: func(existingPath string) (src.VideoCSVRowWriter, error) {
-				return export.OpenVideoCSVWriter(existingPath)
+				return export.OpenVideoCSVWriter(existingPath, videoAdapter.Row)
 			},
 			ReadVideoCSV:         export.ReadVideoCSV,
 			ExistingVideoCSVPath: existingVideoCSVPath,
@@ -173,8 +176,8 @@ func main() {
 		}
 	}
 
-	if runStage1 {
-		// If stage 1 only, load mids from intermediate data or progress file.
+	if runStage1 || runStage2 {
+		// If not coming from stage 0, load mids from intermediate data or progress file.
 		var existingCSVPath string
 		if !runStage0 || mids == nil {
 			if prog.Stage >= 1 && len(prog.AuthorMids) > 0 {
@@ -203,7 +206,7 @@ func main() {
 				var err error
 				mids, err = src.LoadIntermediateData(cfg.OutputDir, *platform, *keyword)
 				if err != nil {
-					log.Fatalf("FATAL: Cannot load author list for stage 1: %v", err)
+					log.Fatalf("FATAL: Cannot load author list for stage 1/2: %v", err)
 				}
 				log.Printf("INFO: Loaded %d authors from intermediate data file", len(mids))
 			}
@@ -215,30 +218,60 @@ func main() {
 			mids = mids[:*limit]
 		}
 
-		stage1Cfg := src.Stage1Config{
-			Platform:               *platform,
-			Keyword:                *keyword,
-			OutputDir:              cfg.OutputDir,
-			Concurrency:            cfg.Concurrency,
-			MaxVideoPerAuthor:      cfg.MaxVideoPerAuthor,
-			VideoPageSize:          bilibili.VideoPageSize(),
-			MaxConsecutiveFailures: cfg.MaxConsecutiveFailures,
-			RequestInterval:        cfg.RequestInterval,
-			Progress:               prog,
-			PoolRun:                adaptPoolRun[src.AuthorMid, src.Author],
-			NewAuthorCSVWriter: func(outputDir, platform, keyword string) (src.AuthorCSVRowWriter, error) {
-				return export.NewAuthorCSVWriter(outputDir, platform, keyword)
-			},
-			OpenAuthorCSVWriter: func(existingPath string) (src.AuthorCSVRowWriter, error) {
-				return export.OpenAuthorCSVWriter(existingPath)
-			},
-			ExistingCSVPath: existingCSVPath,
-			CalcAuthorStats: stats.CalcAuthorStats,
-			DetectLanguage:  stats.DetectLanguage,
+		if runStage1 && !runStage2 {
+			// Stage 1 only: basic author info, no video traversal.
+			stage1Cfg := src.Stage1Config{
+				Platform:               *platform,
+				Keyword:                *keyword,
+				OutputDir:              cfg.OutputDir,
+				Concurrency:            cfg.Concurrency,
+				MaxConsecutiveFailures: cfg.MaxConsecutiveFailures,
+				RequestInterval:        cfg.RequestInterval,
+				Progress:               prog,
+				PoolRun:                adaptPoolRun[src.AuthorMid, src.Author],
+				NewAuthorCSVWriter: func(outputDir, platform, keyword string) (src.AuthorCSVRowWriter, error) {
+					return export.NewAuthorCSVWriter(outputDir, platform, keyword,
+						authorAdapter.BasicHeader(), authorAdapter.BasicRow)
+				},
+				OpenAuthorCSVWriter: func(existingPath string) (src.AuthorCSVRowWriter, error) {
+					return export.OpenAuthorCSVWriter(existingPath, authorAdapter.BasicRow)
+				},
+				ExistingCSVPath: existingCSVPath,
+			}
+
+			if err := src.RunStage1(ctx, authorCrawler, mids, stage1Cfg); err != nil {
+				log.Fatalf("FATAL: Stage 1 failed: %v", err)
+			}
 		}
 
-		if err := src.RunStage1(ctx, authorCrawler, mids, stage1Cfg); err != nil {
-			log.Fatalf("FATAL: Stage 1 failed: %v", err)
+		if runStage2 {
+			// Stage 2: full author info with video traversal.
+			stage2Cfg := src.Stage2Config{
+				Platform:               *platform,
+				Keyword:                *keyword,
+				OutputDir:              cfg.OutputDir,
+				Concurrency:            cfg.Concurrency,
+				MaxVideoPerAuthor:      cfg.MaxVideoPerAuthor,
+				MaxConsecutiveFailures: cfg.MaxConsecutiveFailures,
+				RequestInterval:        cfg.RequestInterval,
+				Progress:               prog,
+				PoolRun:                adaptPoolRun[src.AuthorMid, src.Author],
+				NewAuthorCSVWriter: func(outputDir, platform, keyword string) (src.AuthorCSVRowWriter, error) {
+					return export.NewAuthorCSVWriter(outputDir, platform, keyword,
+						authorAdapter.FullHeader(), authorAdapter.FullRow)
+				},
+				OpenAuthorCSVWriter: func(existingPath string) (src.AuthorCSVRowWriter, error) {
+					return export.OpenAuthorCSVWriter(existingPath, authorAdapter.FullRow)
+				},
+				ExistingCSVPath: existingCSVPath,
+				CalcAuthorStats: func(videos []src.VideoDetail, topN int) (src.AuthorStats, []src.TopVideo) {
+					return stats.CalcAuthorStats(videos, topN, bilibili.VideoURLPrefix)
+				},
+			}
+
+			if err := src.RunStage2(ctx, authorCrawler, mids, stage2Cfg); err != nil {
+				log.Fatalf("FATAL: Stage 2 failed: %v", err)
+			}
 		}
 	}
 

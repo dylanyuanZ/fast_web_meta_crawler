@@ -7,6 +7,9 @@ BIN_DIR  := bin
 CMDS     := $(notdir $(wildcard cmd/*))
 BINARIES := $(addprefix $(BIN_DIR)/,$(CMDS))
 
+# All Go source files (for dependency tracking)
+GO_SOURCES := $(shell find cmd/ src/ -name '*.go' 2>/dev/null)
+
 # Go build flags
 GO       := go
 GOFLAGS  := -trimpath
@@ -24,7 +27,7 @@ all: $(BINARIES)
 ## Build individual binary: make crawler / make probe / make killold
 $(CMDS): %: $(BIN_DIR)/%
 
-$(BIN_DIR)/%: cmd/%
+$(BIN_DIR)/%: $(GO_SOURCES)
 	@mkdir -p $(BIN_DIR)
 	$(GO) build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $@ ./cmd/$*
 

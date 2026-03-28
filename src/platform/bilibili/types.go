@@ -75,6 +75,28 @@ type UserStatData struct {
 	Follower int64 `json:"follower"` // follower count
 }
 
+// ==================== Up Stat API Response ====================
+// API: GET https://api.bilibili.com/x/space/upstat?mid=xxx
+// Returns total play count and total likes for an UP master.
+
+// UpStatResp is the top-level response from Bilibili up stat API.
+type UpStatResp struct {
+	Code    int        `json:"code"`
+	Message string     `json:"message"`
+	Data    UpStatData `json:"data"`
+}
+
+// UpStatData holds the UP master's aggregated statistics.
+type UpStatData struct {
+	Archive UpStatArchive `json:"archive"` // video archive stats
+	Likes   int64         `json:"likes"`   // total likes across all content
+}
+
+// UpStatArchive holds the UP master's video archive statistics.
+type UpStatArchive struct {
+	View int64 `json:"view"` // total play count across all videos
+}
+
 // ==================== Video List API Response ====================
 // API: GET https://api.bilibili.com/x/space/wbi/arc/search?mid=xxx&pn=N&ps=50
 

@@ -45,7 +45,6 @@ func (m *mockAuthorCrawler) FetchAuthorInfo(ctx context.Context, mid string) (*s
 	return &src.AuthorInfo{
 		Name:      "author_" + mid,
 		Followers: 1000,
-		Region:    "China",
 	}, nil
 }
 
@@ -85,13 +84,26 @@ func interruptingPoolRun[T any, R any](stopAfter int) src.PoolRunFunc[T, R] {
 	}
 }
 
+// fakeAuthorToRow is a simple row converter for test CSV writers.
+func fakeAuthorToRow(author src.Author) []string {
+	return []string{author.Name, author.ID}
+}
+
+// fakeVideoToRow is a simple row converter for test CSV writers.
+func fakeVideoToRow(video src.Video) []string {
+	return []string{video.Title, video.Author, video.AuthorID,
+		fmt.Sprintf("%d", video.PlayCount),
+		video.PubDate.Format("2006-01-02 15:04:05"),
+		fmt.Sprintf("%d", video.Duration),
+		video.Source}
+}
+
 // fakeCalcAuthorStats returns deterministic stats.
 func fakeCalcAuthorStats(videos []src.VideoDetail, topN int) (src.AuthorStats, []src.TopVideo) {
 	stats := src.AuthorStats{
 		AvgPlayCount:    100.0,
 		AvgDuration:     60.0,
 		AvgCommentCount: 5.0,
-		AvgLikeCount:    20.0,
 	}
 	var topVideos []src.TopVideo
 	for i, v := range videos {
@@ -105,11 +117,6 @@ func fakeCalcAuthorStats(videos []src.VideoDetail, topN int) (src.AuthorStats, [
 		})
 	}
 	return stats, topVideos
-}
-
-// fakeDetectLanguage returns a fixed language.
-func fakeDetectLanguage(titles []string) string {
-	return "Chinese"
 }
 
 // ==================== Stage 0 Tests ====================
@@ -133,10 +140,11 @@ func TestStage0_NormalRun(t *testing.T) {
 		Progress:               prog,
 		PoolRun:                fakePoolRun[int, []src.Video],
 		NewVideoCSVWriter: func(outputDir, platform, keyword string) (src.VideoCSVRowWriter, error) {
-			return export.NewVideoCSVWriter(outputDir, platform, keyword)
+			return export.NewVideoCSVWriter(outputDir, platform, keyword,
+				[]string{"标题", "作者", "AuthorID", "播放次数", "发布时间", "视频时长(s)", "来源"}, fakeVideoToRow)
 		},
 		OpenVideoCSVWriter: func(existingPath string) (src.VideoCSVRowWriter, error) {
-			return export.OpenVideoCSVWriter(existingPath)
+			return export.OpenVideoCSVWriter(existingPath, fakeVideoToRow)
 		},
 		ReadVideoCSV: export.ReadVideoCSV,
 	}
@@ -193,10 +201,11 @@ func TestStage0_WithInterruption(t *testing.T) {
 		Progress:               prog,
 		PoolRun:                interruptingPoolRun[int, []src.Video](1),
 		NewVideoCSVWriter: func(outputDir, platform, keyword string) (src.VideoCSVRowWriter, error) {
-			return export.NewVideoCSVWriter(outputDir, platform, keyword)
+			return export.NewVideoCSVWriter(outputDir, platform, keyword,
+				[]string{"标题", "作者", "AuthorID", "播放次数", "发布时间", "视频时长(s)", "来源"}, fakeVideoToRow)
 		},
 		OpenVideoCSVWriter: func(existingPath string) (src.VideoCSVRowWriter, error) {
-			return export.OpenVideoCSVWriter(existingPath)
+			return export.OpenVideoCSVWriter(existingPath, fakeVideoToRow)
 		},
 		ReadVideoCSV: export.ReadVideoCSV,
 	}
@@ -242,10 +251,11 @@ func TestStage0_WithInterruption(t *testing.T) {
 		Progress:               prog,
 		PoolRun:                fakePoolRun[int, []src.Video],
 		NewVideoCSVWriter: func(outputDir, platform, keyword string) (src.VideoCSVRowWriter, error) {
-			return export.NewVideoCSVWriter(outputDir, platform, keyword)
+			return export.NewVideoCSVWriter(outputDir, platform, keyword,
+				[]string{"标题", "作者", "AuthorID", "播放次数", "发布时间", "视频时长(s)", "来源"}, fakeVideoToRow)
 		},
 		OpenVideoCSVWriter: func(existingPath string) (src.VideoCSVRowWriter, error) {
-			return export.OpenVideoCSVWriter(existingPath)
+			return export.OpenVideoCSVWriter(existingPath, fakeVideoToRow)
 		},
 		ReadVideoCSV:         export.ReadVideoCSV,
 		ExistingVideoCSVPath: existingCSVPath,
@@ -316,20 +326,17 @@ func TestStage1_NormalRun(t *testing.T) {
 		Keyword:                "test",
 		OutputDir:              tmpDir,
 		Concurrency:            1,
-		MaxVideoPerAuthor:      100,
-		VideoPageSize:          30,
 		MaxConsecutiveFailures: 5,
 		RequestInterval:        0,
 		Progress:               prog,
 		PoolRun:                fakePoolRun[src.AuthorMid, src.Author],
 		NewAuthorCSVWriter: func(outputDir, platform, keyword string) (src.AuthorCSVRowWriter, error) {
-			return export.NewAuthorCSVWriter(outputDir, platform, keyword)
+			return export.NewAuthorCSVWriter(outputDir, platform, keyword,
+				[]string{"Name", "ID"}, fakeAuthorToRow)
 		},
 		OpenAuthorCSVWriter: func(existingPath string) (src.AuthorCSVRowWriter, error) {
-			return export.OpenAuthorCSVWriter(existingPath)
+			return export.OpenAuthorCSVWriter(existingPath, fakeAuthorToRow)
 		},
-		CalcAuthorStats: fakeCalcAuthorStats,
-		DetectLanguage:  fakeDetectLanguage,
 	}
 
 	if err := src.RunStage1(ctx, ac, mids, cfg); err != nil {
@@ -382,20 +389,17 @@ func TestStage1_WithInterruption(t *testing.T) {
 		Keyword:                "test",
 		OutputDir:              tmpDir,
 		Concurrency:            1,
-		MaxVideoPerAuthor:      100,
-		VideoPageSize:          30,
 		MaxConsecutiveFailures: 5,
 		RequestInterval:        0,
 		Progress:               prog,
 		PoolRun:                interruptingPoolRun[src.AuthorMid, src.Author](2),
 		NewAuthorCSVWriter: func(outputDir, platform, keyword string) (src.AuthorCSVRowWriter, error) {
-			return export.NewAuthorCSVWriter(outputDir, platform, keyword)
+			return export.NewAuthorCSVWriter(outputDir, platform, keyword,
+				[]string{"Name", "ID"}, fakeAuthorToRow)
 		},
 		OpenAuthorCSVWriter: func(existingPath string) (src.AuthorCSVRowWriter, error) {
-			return export.OpenAuthorCSVWriter(existingPath)
+			return export.OpenAuthorCSVWriter(existingPath, fakeAuthorToRow)
 		},
-		CalcAuthorStats: fakeCalcAuthorStats,
-		DetectLanguage:  fakeDetectLanguage,
 	}
 
 	if err := src.RunStage1(ctx, ac, allMids, cfg1); err != nil {
@@ -438,21 +442,18 @@ func TestStage1_WithInterruption(t *testing.T) {
 		Keyword:                "test",
 		OutputDir:              tmpDir,
 		Concurrency:            1,
-		MaxVideoPerAuthor:      100,
-		VideoPageSize:          30,
 		MaxConsecutiveFailures: 5,
 		RequestInterval:        0,
 		Progress:               prog,
 		PoolRun:                fakePoolRun[src.AuthorMid, src.Author],
 		NewAuthorCSVWriter: func(outputDir, platform, keyword string) (src.AuthorCSVRowWriter, error) {
-			return export.NewAuthorCSVWriter(outputDir, platform, keyword)
+			return export.NewAuthorCSVWriter(outputDir, platform, keyword,
+				[]string{"Name", "ID"}, fakeAuthorToRow)
 		},
 		OpenAuthorCSVWriter: func(existingPath string) (src.AuthorCSVRowWriter, error) {
-			return export.OpenAuthorCSVWriter(existingPath)
+			return export.OpenAuthorCSVWriter(existingPath, fakeAuthorToRow)
 		},
 		ExistingCSVPath: existingCSVPath,
-		CalcAuthorStats: fakeCalcAuthorStats,
-		DetectLanguage:  fakeDetectLanguage,
 	}
 
 	if err := src.RunStage1(ctx, ac, pendingMids, cfg2); err != nil {

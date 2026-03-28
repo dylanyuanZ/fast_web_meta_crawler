@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -25,119 +24,23 @@ func GenerateFileName(platform, keyword, fileType string) string {
 	)
 }
 
-// WriteVideoCSV writes a list of videos to a CSV file in the output directory.
-// Returns the full path of the created file.
-func WriteVideoCSV(outputDir string, videos []src.Video, platform, keyword string) (string, error) {
-	if err := os.MkdirAll(outputDir, 0o755); err != nil {
-		return "", fmt.Errorf("create output dir: %w", err)
-	}
-
-	filename := GenerateFileName(platform, keyword, "videos")
-	fullPath := filepath.Join(outputDir, filename)
-
-	f, err := os.Create(fullPath)
-	if err != nil {
-		return "", fmt.Errorf("create file: %w", err)
-	}
-	defer f.Close()
-
-	// Write UTF-8 BOM for Excel compatibility.
-	if _, err := f.Write([]byte{0xEF, 0xBB, 0xBF}); err != nil {
-		return "", fmt.Errorf("write BOM: %w", err)
-	}
-
-	w := csv.NewWriter(f)
-	defer w.Flush()
-
-	// Write header.
-	if err := w.Write(videoCSVHeader); err != nil {
-		return "", fmt.Errorf("write header: %w", err)
-	}
-
-	// Write data rows.
-	for _, v := range videos {
-		if err := w.Write(videoToRow(v)); err != nil {
-			return "", fmt.Errorf("write row: %w", err)
-		}
-	}
-
-	return fullPath, nil
-}
-
-// WriteAuthorCSV writes a list of authors to a CSV file in the output directory.
-// TOP video columns use Excel HYPERLINK formula for clickable links.
-// Returns the full path of the created file.
-func WriteAuthorCSV(outputDir string, authors []src.Author, platform, keyword string) (string, error) {
-	if err := os.MkdirAll(outputDir, 0o755); err != nil {
-		return "", fmt.Errorf("create output dir: %w", err)
-	}
-
-	filename := GenerateFileName(platform, keyword, "authors")
-	fullPath := filepath.Join(outputDir, filename)
-
-	f, err := os.Create(fullPath)
-	if err != nil {
-		return "", fmt.Errorf("create file: %w", err)
-	}
-	defer f.Close()
-
-	// Write UTF-8 BOM for Excel compatibility.
-	if _, err := f.Write([]byte{0xEF, 0xBB, 0xBF}); err != nil {
-		return "", fmt.Errorf("write BOM: %w", err)
-	}
-
-	w := csv.NewWriter(f)
-	defer w.Flush()
-
-	// Write header.
-	if err := w.Write(authorCSVHeader); err != nil {
-		return "", fmt.Errorf("write header: %w", err)
-	}
-
-	// Write data rows.
-	for _, a := range authors {
-		if err := w.Write(authorToRow(a)); err != nil {
-			return "", fmt.Errorf("write row: %w", err)
-		}
-	}
-
-	return fullPath, nil
-}
-
-// ==================== Video CSV header and row helpers ====================
-
-// videoCSVHeader is the shared header for video CSV files (7 columns, with AuthorID).
-var videoCSVHeader = []string{
-	"标题", "作者", "AuthorID", "播放次数", "发布时间", "视频时长(s)", "来源",
-}
-
-// videoToRow converts a Video to a CSV row (matches videoCSVHeader column order).
-func videoToRow(v src.Video) []string {
-	return []string{
-		v.Title,
-		v.Author,
-		v.AuthorID,
-		fmt.Sprintf("%d", v.PlayCount),
-		v.PubDate.Format("2006-01-02 15:04:05"),
-		fmt.Sprintf("%d", v.Duration),
-		v.Source,
-	}
-}
-
 // ==================== VideoCSVWriter (incremental append) ====================
 
 // VideoCSVWriter provides concurrent-safe, incremental CSV writing for video data.
 // Each WriteRows call appends multiple rows and flushes immediately.
 type VideoCSVWriter struct {
-	f    *os.File
-	w    *csv.Writer
-	mu   sync.Mutex
-	path string // absolute file path
+	f     *os.File
+	w     *csv.Writer
+	mu    sync.Mutex
+	path  string                   // absolute file path
+	toRow func(src.Video) []string // platform-specific row conversion
 }
 
 // NewVideoCSVWriter creates a new video CSV file with BOM and header row.
+// header and toRow are provided by the platform-specific CSV adapter.
 // Used for first-time runs. Caller must call Close() when done.
-func NewVideoCSVWriter(outputDir, platform, keyword string) (*VideoCSVWriter, error) {
+func NewVideoCSVWriter(outputDir, platform, keyword string,
+	header []string, toRow func(src.Video) []string) (*VideoCSVWriter, error) {
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create output dir: %w", err)
 	}
@@ -157,7 +60,7 @@ func NewVideoCSVWriter(outputDir, platform, keyword string) (*VideoCSVWriter, er
 	}
 
 	w := csv.NewWriter(f)
-	if err := w.Write(videoCSVHeader); err != nil {
+	if err := w.Write(header); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("write header: %w", err)
 	}
@@ -173,12 +76,13 @@ func NewVideoCSVWriter(outputDir, platform, keyword string) (*VideoCSVWriter, er
 	}
 
 	log.Printf("INFO: Video CSV created: %s", absPath)
-	return &VideoCSVWriter{f: f, w: w, path: absPath}, nil
+	return &VideoCSVWriter{f: f, w: w, path: absPath, toRow: toRow}, nil
 }
 
 // OpenVideoCSVWriter opens an existing video CSV file in append mode (no header written).
+// toRow is provided by the platform-specific CSV adapter.
 // Used for resuming interrupted runs. Caller must call Close() when done.
-func OpenVideoCSVWriter(existingPath string) (*VideoCSVWriter, error) {
+func OpenVideoCSVWriter(existingPath string, toRow func(src.Video) []string) (*VideoCSVWriter, error) {
 	f, err := os.OpenFile(existingPath, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open existing video CSV: %w", err)
@@ -192,7 +96,7 @@ func OpenVideoCSVWriter(existingPath string) (*VideoCSVWriter, error) {
 	}
 
 	log.Printf("INFO: Video CSV opened for append: %s", absPath)
-	return &VideoCSVWriter{f: f, w: w, path: absPath}, nil
+	return &VideoCSVWriter{f: f, w: w, path: absPath, toRow: toRow}, nil
 }
 
 // WriteRows appends multiple video rows to the CSV file. Concurrent-safe.
@@ -206,7 +110,7 @@ func (vw *VideoCSVWriter) WriteRows(videos []src.Video) error {
 	}
 
 	for _, v := range videos {
-		if err := vw.w.Write(videoToRow(v)); err != nil {
+		if err := vw.w.Write(vw.toRow(v)); err != nil {
 			return fmt.Errorf("write row: %w", err)
 		}
 	}
@@ -316,49 +220,23 @@ func ReadVideoCSV(csvPath string) ([]src.Video, error) {
 	return videos, nil
 }
 
-// ==================== Author CSV header and row helpers ====================
-
-// authorCSVHeader is the shared header for author CSV files (13 columns, with ID).
-var authorCSVHeader = []string{
-	"博主名字", "ID", "粉丝数", "视频数量",
-	"视频平均播放量", "视频平均时长", "视频平均评论数", "视频平均点赞量",
-	"地区", "语言",
-	"视频_TOP1", "视频_TOP2", "视频_TOP3",
-}
-
-// authorToRow converts an Author to a CSV row (matches authorCSVHeader column order).
-func authorToRow(a src.Author) []string {
-	return []string{
-		a.Name,
-		a.ID,
-		fmt.Sprintf("%d", a.Followers),
-		fmt.Sprintf("%d", a.VideoCount),
-		fmt.Sprintf("%.1f", a.Stats.AvgPlayCount),
-		fmt.Sprintf("%.1f", a.Stats.AvgDuration),
-		fmt.Sprintf("%.1f", a.Stats.AvgCommentCount),
-		fmt.Sprintf("%.1f", a.Stats.AvgLikeCount),
-		a.Region,
-		a.Language,
-		topVideoHyperlink(a.TopVideos, 0),
-		topVideoHyperlink(a.TopVideos, 1),
-		topVideoHyperlink(a.TopVideos, 2),
-	}
-}
-
 // ==================== AuthorCSVWriter (incremental append) ====================
 
 // AuthorCSVWriter provides concurrent-safe, incremental CSV writing for author data.
 // Each WriteRow call appends one row and flushes immediately to ensure data persistence.
 type AuthorCSVWriter struct {
-	f    *os.File
-	w    *csv.Writer
-	mu   sync.Mutex
-	path string // absolute file path
+	f     *os.File
+	w     *csv.Writer
+	mu    sync.Mutex
+	path  string                    // absolute file path
+	toRow func(src.Author) []string // platform-specific row conversion
 }
 
 // NewAuthorCSVWriter creates a new author CSV file with BOM and header row.
+// header and toRow are provided by the platform-specific CSV adapter.
 // Used for first-time runs. Caller must call Close() when done.
-func NewAuthorCSVWriter(outputDir, platform, keyword string) (*AuthorCSVWriter, error) {
+func NewAuthorCSVWriter(outputDir, platform, keyword string,
+	header []string, toRow func(src.Author) []string) (*AuthorCSVWriter, error) {
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create output dir: %w", err)
 	}
@@ -378,7 +256,7 @@ func NewAuthorCSVWriter(outputDir, platform, keyword string) (*AuthorCSVWriter, 
 	}
 
 	w := csv.NewWriter(f)
-	if err := w.Write(authorCSVHeader); err != nil {
+	if err := w.Write(header); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("write header: %w", err)
 	}
@@ -394,12 +272,13 @@ func NewAuthorCSVWriter(outputDir, platform, keyword string) (*AuthorCSVWriter, 
 	}
 
 	log.Printf("INFO: Author CSV created: %s", absPath)
-	return &AuthorCSVWriter{f: f, w: w, path: absPath}, nil
+	return &AuthorCSVWriter{f: f, w: w, path: absPath, toRow: toRow}, nil
 }
 
 // OpenAuthorCSVWriter opens an existing author CSV file in append mode (no header written).
+// toRow is provided by the platform-specific CSV adapter.
 // Used for resuming interrupted runs. Caller must call Close() when done.
-func OpenAuthorCSVWriter(existingPath string) (*AuthorCSVWriter, error) {
+func OpenAuthorCSVWriter(existingPath string, toRow func(src.Author) []string) (*AuthorCSVWriter, error) {
 	f, err := os.OpenFile(existingPath, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open existing CSV: %w", err)
@@ -413,7 +292,7 @@ func OpenAuthorCSVWriter(existingPath string) (*AuthorCSVWriter, error) {
 	}
 
 	log.Printf("INFO: Author CSV opened for append: %s", absPath)
-	return &AuthorCSVWriter{f: f, w: w, path: absPath}, nil
+	return &AuthorCSVWriter{f: f, w: w, path: absPath, toRow: toRow}, nil
 }
 
 // WriteRow appends one author row to the CSV file. Concurrent-safe.
@@ -426,7 +305,7 @@ func (aw *AuthorCSVWriter) WriteRow(author src.Author) error {
 		return fmt.Errorf("write row: writer already closed")
 	}
 
-	if err := aw.w.Write(authorToRow(author)); err != nil {
+	if err := aw.w.Write(aw.toRow(author)); err != nil {
 		return fmt.Errorf("write row: %w", err)
 	}
 	aw.w.Flush()
@@ -506,16 +385,4 @@ func ReadCompletedAuthors(csvPath string) (map[string]bool, error) {
 
 	log.Printf("INFO: Read %d completed authors from CSV: %s", len(completed), csvPath)
 	return completed, nil
-}
-
-// topVideoHyperlink generates an Excel HYPERLINK formula for the i-th top video.
-// Returns empty string if index is out of range.
-func topVideoHyperlink(topVideos []src.TopVideo, index int) string {
-	if index >= len(topVideos) {
-		return ""
-	}
-	v := topVideos[index]
-	// Escape double quotes in title for Excel formula.
-	title := strings.ReplaceAll(v.Title, "\"", "\"\"")
-	return fmt.Sprintf(`=HYPERLINK("%s","%s")`, v.URL, title)
 }

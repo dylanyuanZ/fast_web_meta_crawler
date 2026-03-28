@@ -201,9 +201,9 @@ func RunStage0(ctx context.Context, sc SearchCrawler, keyword string, cfg Stage0
 	return mids, nil
 }
 
-// RunStage1 orchestrates stage 1: iterate authors → fetch details → calc stats → export CSV.
-// Each author is written to CSV immediately after processing (real-time persistence).
-// Internally uses Worker Pool for author-level concurrency.
+// RunStage1 orchestrates stage 1: iterate authors → fetch basic info → export CSV.
+// Stage 1 is lightweight: only calls FetchAuthorInfo, no video traversal.
+// No cooldown or retry — FetchAuthorInfo is a single page load with low risk control risk.
 func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stage1Config) error {
 	start := time.Now()
 	log.Printf("INFO: Stage 1 started, %d authors to process, concurrency=%d", len(mids), cfg.Concurrency)
@@ -217,10 +217,8 @@ func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 	var csvWriter AuthorCSVRowWriter
 	var err error
 	if cfg.ExistingCSVPath != "" {
-		// Resume: open existing CSV in append mode (no header).
 		csvWriter, err = cfg.OpenAuthorCSVWriter(cfg.ExistingCSVPath)
 	} else {
-		// First run: create new CSV with BOM + header.
 		csvWriter, err = cfg.NewAuthorCSVWriter(cfg.OutputDir, cfg.Platform, cfg.Keyword)
 	}
 	if err != nil {
@@ -235,25 +233,13 @@ func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 		}
 	}
 
-	// Step 3: Create global cooldown for 412 risk control.
-	// When any worker hits 412, all workers pause to let the rate limit window pass.
-	cd := &pool.Cooldown{}
-	cfg.Cooldown = cd
-
-	// Step 4: Worker Pool — worker closure captures csvWriter for real-time CSV writing.
+	// Step 3: Worker Pool — no cooldown, no retry for Stage 1.
 	results := cfg.PoolRun(ctx, cfg.Concurrency, mids,
 		func(ctx context.Context, mid AuthorMid) (Author, error) {
-			// Wait for global cooldown before starting.
-			cd.Wait(ctx)
-			if ctx.Err() != nil {
-				return Author{}, ctx.Err()
-			}
-
-			author, err := processOneAuthor(ctx, ac, mid, cfg)
+			author, err := processOneAuthorBasic(ctx, ac, mid)
 			if err != nil {
 				return Author{}, err
 			}
-			// Write to CSV immediately (replaces old MarkDone).
 			if writeErr := csvWriter.WriteRow(author); writeErr != nil {
 				log.Printf("WARN: failed to write author %s to CSV: %v", mid.ID, writeErr)
 			}
@@ -282,43 +268,129 @@ func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 	return nil
 }
 
-// processOneAuthor fetches all data for a single author and assembles the Author struct.
-func processOneAuthor(ctx context.Context, ac AuthorCrawler, mid AuthorMid, cfg Stage1Config) (Author, error) {
-	const maxRetries = 3
+// RunStage2 orchestrates stage 2: iterate authors → fetch info + videos → calc stats → export CSV.
+// Stage 2 includes cooldown and retry for 412 risk control resilience.
+func RunStage2(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stage2Config) error {
+	start := time.Now()
+	log.Printf("INFO: Stage 2 started, %d authors to process, concurrency=%d", len(mids), cfg.Concurrency)
+
+	if len(mids) == 0 {
+		log.Printf("INFO: [Stage 2] No authors to process, skipping")
+		return nil
+	}
+
+	// Step 1: Create or open CSVWriter.
+	var csvWriter AuthorCSVRowWriter
+	var err error
+	if cfg.ExistingCSVPath != "" {
+		csvWriter, err = cfg.OpenAuthorCSVWriter(cfg.ExistingCSVPath)
+	} else {
+		csvWriter, err = cfg.NewAuthorCSVWriter(cfg.OutputDir, cfg.Platform, cfg.Keyword)
+	}
+	if err != nil {
+		return fmt.Errorf("create/open author CSV writer: %w", err)
+	}
+	defer csvWriter.Close()
+
+	// Step 2: Record CSV path in progress.
+	if cfg.Progress != nil {
+		if saveErr := cfg.Progress.SetAuthorCSVPath(cfg.OutputDir, csvWriter.FilePath()); saveErr != nil {
+			log.Printf("WARN: failed to save author CSV path to progress: %v", saveErr)
+		}
+	}
+
+	// Step 3: Create global cooldown for 412 risk control.
+	cd := cfg.Cooldown
+	if cd == nil {
+		cd = &pool.Cooldown{}
+	}
+
+	// Step 4: Worker Pool with cooldown and retry.
+	results := cfg.PoolRun(ctx, cfg.Concurrency, mids,
+		func(ctx context.Context, mid AuthorMid) (Author, error) {
+			cd.Wait(ctx)
+			if ctx.Err() != nil {
+				return Author{}, ctx.Err()
+			}
+
+			author, err := retryWithCooldown(ctx, 3, cd,
+				fmt.Sprintf("author %s (mid=%s)", mid.Name, mid.ID),
+				func() (Author, error) {
+					return processOneAuthorFull(ctx, ac, mid, cfg)
+				},
+			)
+			if err != nil {
+				return Author{}, err
+			}
+
+			if writeErr := csvWriter.WriteRow(author); writeErr != nil {
+				log.Printf("WARN: failed to write author %s to CSV: %v", mid.ID, writeErr)
+			}
+			return author, nil
+		},
+		cfg.MaxConsecutiveFailures,
+		cfg.RequestInterval,
+	)
+
+	// Step 5: Collect and log results.
+	successCount := 0
+	failCount := 0
+	for _, r := range results {
+		if r.Err != nil {
+			failCount++
+			log.Printf("ERROR: Failed to fetch author %s (mid=%s): %v", r.Task.Name, r.Task.ID, r.Err)
+		} else {
+			successCount++
+		}
+	}
+
+	log.Printf("INFO: [Stage 2] Authors: success=%d, failed=%d", successCount, failCount)
+	log.Printf("INFO: [Stage 2] Author CSV: %s", csvWriter.FilePath())
+	log.Printf("INFO: [Stage 2] Completed in %v", time.Since(start).Round(time.Second))
+
+	return nil
+}
+
+// retryWithCooldown retries a function up to maxRetries times with exponential backoff.
+// On retryable errors (412, intercept timeout), triggers global cooldown so all workers pause.
+// Non-retryable errors are returned immediately without retry.
+func retryWithCooldown[T any](
+	ctx context.Context,
+	maxRetries int,
+	cd *pool.Cooldown,
+	label string,
+	fn func() (T, error),
+) (T, error) {
+	var zero T
 	var lastErr error
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
-			// Trigger global cooldown so ALL workers pause, not just this one.
-			// This prevents other workers from also hitting 412 during the backoff.
 			backoff := time.Duration(10<<(attempt-1)) * time.Second
-			if cfg.Cooldown != nil {
-				cfg.Cooldown.Trigger(backoff)
+			if cd != nil {
+				cd.Trigger(backoff)
 			}
-			log.Printf("WARN: Retrying author %s (mid=%s) in %v (attempt %d/%d, last error: %v)",
-				mid.Name, mid.ID, backoff, attempt, maxRetries, lastErr)
+			log.Printf("WARN: Retrying %s in %v (attempt %d/%d, last error: %v)",
+				label, backoff, attempt, maxRetries, lastErr)
 			select {
 			case <-ctx.Done():
-				return Author{}, fmt.Errorf("context cancelled during retry backoff: %w", ctx.Err())
+				return zero, fmt.Errorf("context cancelled during retry backoff: %w", ctx.Err())
 			case <-time.After(backoff):
 			}
 		}
 
-		author, err := processOneAuthorOnce(ctx, ac, mid, cfg)
+		result, err := fn()
 		if err == nil {
-			return author, nil
+			return result, nil
 		}
 		lastErr = err
 
-		// Retry on 412 (risk control) and intercept timeout errors.
-		// During rate limiting, intercept timeouts are often caused by the same
-		// anti-crawl mechanism that produces 412 responses.
 		if !isRetryableError(err) {
-			return Author{}, err
+			return zero, err
 		}
 	}
 
-	return Author{}, fmt.Errorf("all %d retries exhausted: %w", maxRetries, lastErr)
+	return zero, fmt.Errorf("all %d retries exhausted for %s: %w", maxRetries, label, lastErr)
 }
 
 // isRetryableError checks if the error is retryable.
@@ -334,7 +406,30 @@ func isRetryableError(err error) bool {
 		strings.Contains(errMsg, "intercept timeout")
 }
 
-func processOneAuthorOnce(ctx context.Context, ac AuthorCrawler, mid AuthorMid, cfg Stage1Config) (Author, error) {
+// processOneAuthorBasic fetches only basic author info (Stage 1 path).
+// No video traversal, no stats calculation.
+func processOneAuthorBasic(ctx context.Context, ac AuthorCrawler, mid AuthorMid) (Author, error) {
+	info, err := ac.FetchAuthorInfo(ctx, mid.ID)
+	if err != nil {
+		return Author{}, fmt.Errorf("fetch author info: %w", err)
+	}
+
+	author := Author{
+		Name:           info.Name,
+		ID:             mid.ID,
+		Followers:      info.Followers,
+		VideoCount:     info.VideoCount,
+		TotalLikes:     info.TotalLikes,
+		TotalPlayCount: info.TotalPlayCount,
+	}
+
+	log.Printf("INFO: Author %s (mid=%s): followers=%d, videos=%d",
+		info.Name, mid.ID, info.Followers, info.VideoCount)
+	return author, nil
+}
+
+// processOneAuthorFull fetches author info + all videos + stats (Stage 2 path).
+func processOneAuthorFull(ctx context.Context, ac AuthorCrawler, mid AuthorMid, cfg Stage2Config) (Author, error) {
 	authorStart := time.Now()
 
 	// Step 1: Fetch author info.
@@ -343,12 +438,12 @@ func processOneAuthorOnce(ctx context.Context, ac AuthorCrawler, mid AuthorMid, 
 		return Author{}, fmt.Errorf("fetch author info: %w", err)
 	}
 
-	// Brief pause between API calls with jitter to avoid fixed-rhythm detection.
+	// Brief pause between API calls with jitter.
 	if cfg.RequestInterval > 0 {
 		time.Sleep(pool.JitteredDuration(cfg.RequestInterval))
 	}
 
-	// Step 2: Fetch all videos (internally paginates from page 1 to last page).
+	// Step 2: Fetch all videos.
 	allVideos, pageInfo, err := ac.FetchAllAuthorVideos(ctx, mid.ID, cfg.MaxVideoPerAuthor)
 	if err != nil {
 		return Author{}, fmt.Errorf("fetch author videos: %w", err)
@@ -357,25 +452,19 @@ func processOneAuthorOnce(ctx context.Context, ac AuthorCrawler, mid AuthorMid, 
 	// Step 3: Calculate stats.
 	stats, topVideos := cfg.CalcAuthorStats(allVideos, 3)
 
-	// Step 4: Detect language from video titles.
-	titles := make([]string, len(allVideos))
-	for i, v := range allVideos {
-		titles[i] = v.Title
-	}
-	language := cfg.DetectLanguage(titles)
-
 	author := Author{
-		Name:       info.Name,
-		ID:         mid.ID,
-		Followers:  info.Followers,
-		Region:     info.Region,
-		Language:   language,
-		VideoCount: pageInfo.TotalCount,
-		Stats:      stats,
-		TopVideos:  topVideos,
+		Name:           info.Name,
+		ID:             mid.ID,
+		Followers:      info.Followers,
+		VideoCount:     pageInfo.TotalCount,
+		TotalLikes:     info.TotalLikes,
+		TotalPlayCount: info.TotalPlayCount,
+		Stats:          stats,
+		TopVideos:      topVideos,
 	}
 
-	log.Printf("INFO: Author %s: %d videos fetched, %v", info.Name, len(allVideos), time.Since(authorStart).Round(time.Millisecond))
+	log.Printf("INFO: Author %s: %d videos fetched, %v",
+		info.Name, len(allVideos), time.Since(authorStart).Round(time.Millisecond))
 	return author, nil
 }
 
@@ -409,14 +498,28 @@ type Stage0Config struct {
 	ExistingVideoCSVPath   string // non-empty when resuming from a previous run
 }
 
-// Stage1Config holds dependencies for RunStage1, enabling testability.
+// Stage1Config holds dependencies for RunStage1 (basic author info, no video traversal).
 type Stage1Config struct {
 	Platform               string
 	Keyword                string
 	OutputDir              string
 	Concurrency            int
+	MaxConsecutiveFailures int
+	RequestInterval        time.Duration
+	Progress               ProgressTracker
+	PoolRun                PoolRunFunc[AuthorMid, Author]
+	NewAuthorCSVWriter     func(outputDir, platform, keyword string) (AuthorCSVRowWriter, error)
+	OpenAuthorCSVWriter    func(existingPath string) (AuthorCSVRowWriter, error)
+	ExistingCSVPath        string // non-empty when resuming from a previous run
+}
+
+// Stage2Config holds dependencies for RunStage2 (full author info with video traversal).
+type Stage2Config struct {
+	Platform               string
+	Keyword                string
+	OutputDir              string
+	Concurrency            int
 	MaxVideoPerAuthor      int
-	VideoPageSize          int
 	MaxConsecutiveFailures int
 	RequestInterval        time.Duration
 	Progress               ProgressTracker
@@ -425,7 +528,6 @@ type Stage1Config struct {
 	OpenAuthorCSVWriter    func(existingPath string) (AuthorCSVRowWriter, error)
 	ExistingCSVPath        string // non-empty when resuming from a previous run
 	CalcAuthorStats        func(videos []VideoDetail, topN int) (AuthorStats, []TopVideo)
-	DetectLanguage         func(titles []string) string
 	Cooldown               *pool.Cooldown // global cooldown for 412 risk control
 }
 

@@ -32,9 +32,11 @@ func NewAuthorCrawler(manager *browser.Manager) *BiliBrowserAuthorCrawler {
 	}
 }
 
-// FetchAuthorInfo opens the author's space page and intercepts user info + stat APIs.
+// FetchAuthorInfo opens the author's space page and intercepts user info, stat,
+// upstat, and video list APIs. Returns extended AuthorInfo with total likes,
+// total play count, and video count.
 // URL: https://space.bilibili.com/{mid}
-// Intercepts: /x/space/acc/info + /x/relation/stat
+// Intercepts: /x/space/acc/info + /x/relation/stat + /x/space/upstat + /x/space/wbi/arc/search
 func (c *BiliBrowserAuthorCrawler) FetchAuthorInfo(ctx context.Context, mid string) (*src.AuthorInfo, error) {
 	page := c.manager.GetPage()
 	defer c.manager.PutPage(page)
@@ -44,6 +46,8 @@ func (c *BiliBrowserAuthorCrawler) FetchAuthorInfo(ctx context.Context, mid stri
 	rules := []browser.InterceptRule{
 		{URLPattern: "/x/space/wbi/acc/info", ID: "user_info"},
 		{URLPattern: "/x/relation/stat", ID: "user_stat"},
+		{URLPattern: "/x/space/upstat", ID: "up_stat"},
+		{URLPattern: "/x/space/wbi/arc/search", ID: "video_list"},
 	}
 
 	results, err := browser.NavigateAndIntercept(ctx, page, targetURL, rules)
@@ -52,21 +56,32 @@ func (c *BiliBrowserAuthorCrawler) FetchAuthorInfo(ctx context.Context, mid stri
 	}
 
 	// Extract response bodies.
-	var infoBody, statBody []byte
+	var infoBody, statBody, upStatBody, videoListBody []byte
 	for _, r := range results {
 		switch r.ID {
 		case "user_info":
 			infoBody = r.Body
 		case "user_stat":
 			statBody = r.Body
+		case "up_stat":
+			upStatBody = r.Body
+		case "video_list":
+			videoListBody = r.Body
 		}
 	}
 
+	// All four APIs must be intercepted — no degradation.
 	if infoBody == nil {
 		return nil, fmt.Errorf("fetch author info mid=%s: user info API not intercepted", mid)
 	}
 	if statBody == nil {
 		return nil, fmt.Errorf("fetch author info mid=%s: user stat API not intercepted", mid)
+	}
+	if upStatBody == nil {
+		return nil, fmt.Errorf("fetch author info mid=%s: up stat API not intercepted", mid)
+	}
+	if videoListBody == nil {
+		return nil, fmt.Errorf("fetch author info mid=%s: video list API not intercepted", mid)
 	}
 
 	// Parse user info.
@@ -87,12 +102,34 @@ func (c *BiliBrowserAuthorCrawler) FetchAuthorInfo(ctx context.Context, mid stri
 		return nil, fmt.Errorf("user stat API error mid=%s (code=%d, message=%s)", mid, statResp.Code, statResp.Message)
 	}
 
-	log.Printf("INFO: [bilibili] Author info fetched: mid=%s, name=%s, followers=%d", mid, infoResp.Data.Name, statResp.Data.Follower)
+	// Parse up stat (total likes + total play count).
+	var upStatResp UpStatResp
+	if err := json.Unmarshal(upStatBody, &upStatResp); err != nil {
+		return nil, fmt.Errorf("parse up stat mid=%s: %w", mid, err)
+	}
+	if upStatResp.Code != 0 {
+		return nil, fmt.Errorf("up stat API error mid=%s (code=%d, message=%s)", mid, upStatResp.Code, upStatResp.Message)
+	}
+
+	// Parse video list (only for page.count = total video count).
+	var videoListResp VideoListResp
+	if err := json.Unmarshal(videoListBody, &videoListResp); err != nil {
+		return nil, fmt.Errorf("parse video list mid=%s: %w", mid, err)
+	}
+	if videoListResp.Code != 0 {
+		return nil, fmt.Errorf("video list API error mid=%s (code=%d, message=%s)", mid, videoListResp.Code, videoListResp.Message)
+	}
+
+	log.Printf("INFO: [bilibili] Author info fetched: mid=%s, name=%s, followers=%d, likes=%d, plays=%d, videos=%d",
+		mid, infoResp.Data.Name, statResp.Data.Follower,
+		upStatResp.Data.Likes, upStatResp.Data.Archive.View, videoListResp.Data.Page.Count)
 
 	return &src.AuthorInfo{
-		Name:      infoResp.Data.Name,
-		Followers: statResp.Data.Follower,
-		Region:    "", // Bilibili user info API does not reliably expose region
+		Name:           infoResp.Data.Name,
+		Followers:      statResp.Data.Follower,
+		TotalLikes:     upStatResp.Data.Likes,
+		TotalPlayCount: upStatResp.Data.Archive.View,
+		VideoCount:     videoListResp.Data.Page.Count,
 	}, nil
 }
 

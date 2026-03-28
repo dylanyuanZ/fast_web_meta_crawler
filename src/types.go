@@ -21,9 +21,11 @@ type Video struct {
 // AuthorInfo holds basic author profile data returned by the author info API.
 // This is raw API data before any stats calculation.
 type AuthorInfo struct {
-	Name      string // author display name
-	Followers int64  // follower count
-	Region    string // location (country > province > city, best effort)
+	Name           string // author display name
+	Followers      int64  // follower count
+	TotalLikes     int64  // total likes across all content (from upstat API)
+	TotalPlayCount int64  // total play count across all videos (from upstat API)
+	VideoCount     int    // total video count (from arc/search API page.count)
 }
 
 // VideoDetail holds detailed video data returned by the author's video list API.
@@ -44,7 +46,6 @@ type AuthorStats struct {
 	AvgPlayCount    float64 // average play count across all videos
 	AvgDuration     float64 // average duration in seconds
 	AvgCommentCount float64 // average comment count
-	AvgLikeCount    float64 // average like count
 }
 
 // TopVideo represents a top-performing video (for CSV HYPERLINK output).
@@ -57,12 +58,38 @@ type TopVideo struct {
 // Author represents a content creator with aggregated stats (stage 1 output).
 // Assembled in RunStage1 from AuthorInfo + stats.CalcAuthorStats() results.
 type Author struct {
-	Name       string      // author display name
-	ID         string      // platform-specific author ID
-	Followers  int64       // follower count
-	Region     string      // location
-	Language   string      // detected language (charset detection on video titles)
-	VideoCount int         // total video count (from API metadata, not len(videos))
-	Stats      AuthorStats // aggregated statistics
-	TopVideos  []TopVideo  // top 3 videos by play count
+	Name           string      // author display name
+	ID             string      // platform-specific author ID
+	Followers      int64       // follower count
+	VideoCount     int         // total video count (from API metadata, not len(videos))
+	TotalLikes     int64       // total likes across all content
+	TotalPlayCount int64       // total play count across all videos
+	Stats          AuthorStats // aggregated statistics
+	TopVideos      []TopVideo  // top 3 videos by play count
+}
+
+// ==================== CSV Adapter Interfaces ====================
+
+// AuthorCSVAdapter defines platform-specific CSV header and row conversion for author data.
+// Implemented by each platform package (e.g. bilibili/csv.go).
+// All methods are pure functions — safe for concurrent use.
+type AuthorCSVAdapter interface {
+	// BasicHeader returns the CSV header for Stage 1 (basic author info, no video traversal).
+	BasicHeader() []string
+	// BasicRow converts an Author to a CSV row matching BasicHeader columns.
+	BasicRow(author Author) []string
+	// FullHeader returns the CSV header for Stage 2 (full author info with video stats).
+	FullHeader() []string
+	// FullRow converts an Author to a CSV row matching FullHeader columns.
+	FullRow(author Author) []string
+}
+
+// VideoCSVAdapter defines platform-specific CSV header and row conversion for video data.
+// Implemented by each platform package (e.g. bilibili/csv.go).
+// All methods are pure functions — safe for concurrent use.
+type VideoCSVAdapter interface {
+	// Header returns the CSV header for video data.
+	Header() []string
+	// Row converts a Video to a CSV row matching Header columns.
+	Row(video Video) []string
 }

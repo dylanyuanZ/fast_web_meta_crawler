@@ -199,7 +199,7 @@ func TestProbeStage1Quick(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchAuthorInfo failed: %v", err)
 	}
-	t.Logf("Author info: name=%s, followers=%d, region=%s", info.Name, info.Followers, info.Region)
+	t.Logf("Author info: name=%s, followers=%d", info.Name, info.Followers)
 
 	// Test FetchAllAuthorVideos.
 	t.Logf("=== Testing FetchAllAuthorVideos for mid=%s ===", mid)

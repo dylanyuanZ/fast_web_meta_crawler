@@ -124,6 +124,7 @@ func (p *Progress) AddSearchPage(outputDir string, page int) error {
 }
 
 // SetAuthorMids sets the deduplicated author list (called after stage 0 completes).
+// Stage is set to 1 (basic author info) — callers may later advance to stage 2.
 func (p *Progress) SetAuthorMids(outputDir string, mids []src.AuthorMid) error {
 	p.mu.Lock()
 	p.AuthorMids = mids
