@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/pool"
@@ -269,7 +268,7 @@ func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 }
 
 // RunStage2 orchestrates stage 2: iterate authors → fetch info + videos → calc stats → export CSV.
-// Stage 2 includes cooldown and retry for 412 risk control resilience.
+// Stage 2 includes cooldown and retry for risk control resilience.
 func RunStage2(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stage2Config) error {
 	start := time.Now()
 	log.Printf("INFO: Stage 2 started, %d authors to process, concurrency=%d", len(mids), cfg.Concurrency)
@@ -299,7 +298,7 @@ func RunStage2(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 		}
 	}
 
-	// Step 3: Create global cooldown for 412 risk control.
+	// Step 3: Create global cooldown for risk control.
 	cd := cfg.Cooldown
 	if cd == nil {
 		cd = &pool.Cooldown{}
@@ -318,6 +317,7 @@ func RunStage2(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 				func() (Author, error) {
 					return processOneAuthorFull(ctx, ac, mid, cfg)
 				},
+				cfg.IsRetryableError,
 			)
 			if err != nil {
 				return Author{}, err
@@ -352,14 +352,16 @@ func RunStage2(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 }
 
 // retryWithCooldown retries a function up to maxRetries times with exponential backoff.
-// On retryable errors (412, intercept timeout), triggers global cooldown so all workers pause.
+// On retryable errors, triggers global cooldown so all workers pause.
 // Non-retryable errors are returned immediately without retry.
+// The isRetryable function is platform-specific and injected by the caller.
 func retryWithCooldown[T any](
 	ctx context.Context,
 	maxRetries int,
 	cd *pool.Cooldown,
 	label string,
 	fn func() (T, error),
+	isRetryable func(error) bool,
 ) (T, error) {
 	var zero T
 	var lastErr error
@@ -385,25 +387,12 @@ func retryWithCooldown[T any](
 		}
 		lastErr = err
 
-		if !isRetryableError(err) {
+		if isRetryable == nil || !isRetryable(err) {
 			return zero, err
 		}
 	}
 
 	return zero, fmt.Errorf("all %d retries exhausted for %s: %w", maxRetries, label, lastErr)
-}
-
-// isRetryableError checks if the error is retryable.
-// Retryable errors include:
-//   - 412 risk control responses from Bilibili
-//   - Intercept timeouts (often caused by the same anti-crawl mechanism during rate limiting)
-func isRetryableError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errMsg := err.Error()
-	return strings.Contains(errMsg, "status=412") ||
-		strings.Contains(errMsg, "intercept timeout")
 }
 
 // processOneAuthorBasic fetches only basic author info (Stage 1 path).
@@ -528,7 +517,8 @@ type Stage2Config struct {
 	OpenAuthorCSVWriter    func(existingPath string) (AuthorCSVRowWriter, error)
 	ExistingCSVPath        string // non-empty when resuming from a previous run
 	CalcAuthorStats        func(videos []VideoDetail, topN int) (AuthorStats, []TopVideo)
-	Cooldown               *pool.Cooldown // global cooldown for 412 risk control
+	Cooldown               *pool.Cooldown       // global cooldown for risk control
+	IsRetryableError       func(err error) bool // platform-specific retryable error check
 }
 
 // AuthorCSVRowWriter abstracts incremental CSV writing for author data.

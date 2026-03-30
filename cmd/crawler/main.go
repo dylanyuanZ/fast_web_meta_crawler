@@ -267,6 +267,7 @@ func main() {
 				CalcAuthorStats: func(videos []src.VideoDetail, topN int) (src.AuthorStats, []src.TopVideo) {
 					return stats.CalcAuthorStats(videos, topN, bilibili.VideoURLPrefix)
 				},
+				IsRetryableError: bilibili.IsRetryableError,
 			}
 
 			if err := src.RunStage2(ctx, authorCrawler, mids, stage2Cfg); err != nil {
