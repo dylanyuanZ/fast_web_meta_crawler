@@ -55,12 +55,13 @@ type BilibiliConfig struct {
 // YouTubeConfig holds YouTube platform-specific configuration.
 type YouTubeConfig struct {
 	// Filter options for search (Stage 0).
-	FilterType      string        `yaml:"filter_type"`      // "video" or "short" (empty = all)
-	FilterDuration  string        `yaml:"filter_duration"`  // "short" (<4min), "medium" (4-20min), "long" (>20min)
-	FilterUpload    string        `yaml:"filter_upload"`    // "today", "week", "month", "year"
-	SortBy          string        `yaml:"sort_by"`          // "relevance", "date", "view_count", "rating"
-	Concurrency     int           `yaml:"concurrency"`      // platform-level concurrency (0 = use global)
-	RequestInterval time.Duration `yaml:"request_interval"` // platform-level request interval (0 = use global)
+	FilterType       string        `yaml:"filter_type"`         // "video" or "short" (empty = all)
+	FilterDuration   string        `yaml:"filter_duration"`     // "short" (<4min), "medium" (4-20min), "long" (>20min)
+	FilterUpload     string        `yaml:"filter_upload"`       // "today", "week", "month", "year"
+	SearchPageSortBy string        `yaml:"search_page_sort_by"` // search page sort: "relevance" (default), "popularity"
+	AuthorPageSortBy string        `yaml:"author_page_sort_by"` // author videos page sort: "newest" (default), "popular", "oldest"
+	Concurrency      int           `yaml:"concurrency"`         // platform-level concurrency (0 = use global)
+	RequestInterval  time.Duration `yaml:"request_interval"`    // platform-level request interval (0 = use global)
 }
 
 // PlatformConfig holds per-platform configuration.

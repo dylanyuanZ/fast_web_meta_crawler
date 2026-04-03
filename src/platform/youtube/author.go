@@ -11,6 +11,7 @@ import (
 
 	src "github.com/dylanyuanZ/fast_web_meta_crawler/src"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/browser"
+	"github.com/dylanyuanZ/fast_web_meta_crawler/src/config"
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
 )
@@ -78,7 +79,9 @@ func (c *YouTubeAuthorCrawler) FetchAuthorInfo(ctx context.Context, channelID st
 // FetchAllAuthorVideos implements src.AuthorCrawler.
 // For YouTube, this is currently a stub that returns an empty list.
 func (c *YouTubeAuthorCrawler) FetchAllAuthorVideos(ctx context.Context, channelID string, maxVideos int) ([][]string, error) {
-	log.Printf("INFO: [youtube] FetchAllAuthorVideos is a no-op for YouTube (channelID=%s)", channelID)
+	cfg := config.Get()
+	authorSortBy := cfg.Platform.YouTube.AuthorPageSortBy
+	log.Printf("INFO: [youtube] FetchAllAuthorVideos is a no-op for YouTube (channelID=%s, author_page_sort_by=%q)", channelID, authorSortBy)
 	return nil, nil
 }
 
@@ -315,7 +318,8 @@ func parseAboutChannelViewModel(responseBody string, info *AuthorInfo) {
 		info.ChannelID = chID
 	}
 
-	// Extract external links.
+	// Extract external links (with smart dedup: ignore protocol/www differences).
+	seenLinks := make(map[string]bool) // key = normalizeURL(url)
 	if links, ok := viewModel["links"].([]interface{}); ok {
 		for _, link := range links {
 			linkMap, ok := link.(map[string]interface{})
@@ -330,7 +334,12 @@ func parseAboutChannelViewModel(responseBody string, info *AuthorInfo) {
 			// Extract the actual URL from link.content.
 			if linkContent, ok := navigateJSON(linkVM, "link", "content"); ok {
 				if url, ok := linkContent.(string); ok && url != "" {
-					info.ExternalLinks = append(info.ExternalLinks, ensureHTTPS(url))
+					fullURL := ensureHTTPS(url)
+					normalized := normalizeURL(fullURL)
+					if !seenLinks[normalized] {
+						seenLinks[normalized] = true
+						info.ExternalLinks = append(info.ExternalLinks, fullURL)
+					}
 				}
 			}
 		}
@@ -339,15 +348,9 @@ func parseAboutChannelViewModel(responseBody string, info *AuthorInfo) {
 	// Extract canonical YouTube channel URL and add it to external links (with dedup).
 	if canonicalURL, ok := viewModel["canonicalChannelUrl"].(string); ok && canonicalURL != "" {
 		fullURL := ensureHTTPS(canonicalURL)
-		// Only add if not already present in external links.
-		found := false
-		for _, existing := range info.ExternalLinks {
-			if existing == fullURL {
-				found = true
-				break
-			}
-		}
-		if !found {
+		normalized := normalizeURL(fullURL)
+		if !seenLinks[normalized] {
+			seenLinks[normalized] = true
 			// Prepend YouTube link as the first link.
 			info.ExternalLinks = append([]string{fullURL}, info.ExternalLinks...)
 		}
@@ -410,4 +413,21 @@ func ensureHTTPS(url string) string {
 		return url
 	}
 	return "https://" + url
+}
+
+// normalizeURL strips protocol (http/https) and "www." prefix from a URL
+// to produce a canonical form for deduplication.
+// e.g. "https://www.youtube.com/@WMTINTL" → "youtube.com/@WMTINTL"
+//
+//	"http://youtube.com/@WMTINTL"      → "youtube.com/@WMTINTL"
+func normalizeURL(url string) string {
+	s := strings.ToLower(url)
+	// Strip protocol.
+	s = strings.TrimPrefix(s, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	// Strip www. prefix.
+	s = strings.TrimPrefix(s, "www.")
+	// Strip trailing slash for consistency.
+	s = strings.TrimRight(s, "/")
+	return s
 }

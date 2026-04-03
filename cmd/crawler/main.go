@@ -85,6 +85,19 @@ func main() {
 
 	log.Printf("INFO: Configuration loaded: platform=%s, keyword=%q, stage=%s, concurrency=%d, output=%s",
 		*platform, *keyword, *stage, cfg.GetPlatformConcurrency(*platform), cfg.OutputDir)
+	log.Printf("INFO: Search settings: max_search_videos=%d, max_video_per_author=%d, request_interval=%v",
+		cfg.MaxSearchVideos, cfg.MaxVideoPerAuthor, cfg.GetPlatformRequestInterval(*platform))
+
+	// Print platform-specific configuration.
+	switch *platform {
+	case "youtube":
+		ytCfg := cfg.Platform.YouTube
+		log.Printf("INFO: [youtube] Platform config: filter_type=%q, filter_duration=%q, filter_upload=%q, search_page_sort_by=%q, author_page_sort_by=%q",
+			ytCfg.FilterType, ytCfg.FilterDuration, ytCfg.FilterUpload, ytCfg.SearchPageSortBy, ytCfg.AuthorPageSortBy)
+	case "bilibili":
+		hasCookie := cfg.GetBilibiliCookie() != ""
+		log.Printf("INFO: [bilibili] Platform config: cookie_configured=%v", hasCookie)
+	}
 
 	// Setup context with signal handling for graceful shutdown.
 	ctx, cancel := context.WithCancel(context.Background())

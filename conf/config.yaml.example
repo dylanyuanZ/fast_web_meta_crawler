@@ -26,6 +26,7 @@ platform:
     filter_type: "video"       # "video" or "short" (empty = all)
     # filter_duration: "medium"  # "short" (<4min), "medium" (4-20min), "long" (>20min)
     filter_upload: "week"          # "today", "week", "month", "year"
-    # sort_by: "relevance"       # "relevance", "date", "view_count", "rating"
+    # search_page_sort_by: "relevance"  # search page sort: "relevance" (default), "popularity"
+    # author_page_sort_by: "newest"     # author videos page sort: "newest" (default), "popular", "oldest"
     concurrency: 1            # YouTube concurrency (overrides global, strict anti-crawl)
     request_interval: 2500ms  # YouTube request interval (overrides global)

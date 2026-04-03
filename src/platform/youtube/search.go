@@ -64,6 +64,13 @@ func (s *YouTubeSearchRecorder) SearchAndRecord(ctx context.Context, keyword str
 	videos, hasContinuation := parseSearchResults(rawJSON)
 	totalVideos := len(videos)
 
+	// Truncate initial results if they exceed the limit.
+	if len(videos) > cfg.MaxSearchVideos {
+		log.Printf("INFO: [youtube] Initial results (%d) exceed max_search_videos (%d), truncating", len(videos), cfg.MaxSearchVideos)
+		videos = videos[:cfg.MaxSearchVideos]
+		totalVideos = len(videos)
+	}
+
 	// Write initial results to CSV.
 	if len(videos) > 0 {
 		rows := videosToRows(videos)
@@ -183,8 +190,15 @@ func (s *YouTubeSearchRecorder) SearchAndRecord(ctx context.Context, keyword str
 		// Only process videos beyond what we've already seen.
 		if len(domVideos) > totalVideos {
 			newCount := len(domVideos) - totalVideos
+
+			// Truncate to remaining quota so we never exceed max_search_videos.
+			remaining := cfg.MaxSearchVideos - totalVideos
+			if newCount > remaining {
+				newCount = remaining
+			}
+
 			newVideos := make([]Video, 0, newCount)
-			for i := totalVideos; i < len(domVideos); i++ {
+			for i := totalVideos; i < totalVideos+newCount; i++ {
 				dv := domVideos[i]
 				channelID := extractChannelID(dv.ChannelURL)
 				newVideos = append(newVideos, Video{
@@ -236,7 +250,23 @@ func buildSearchURL(keyword string, ytCfg config.YouTubeConfig) string {
 // buildSPParam constructs the YouTube search filter parameter (sp=).
 // YouTube uses a base64-encoded protobuf for search filters.
 // For simplicity, we use known sp values for common filter combinations.
+//
+// Sort priority: when a non-default sort is configured, it takes precedence over filters
+// because YouTube's sp parameter is a protobuf encoding where simple concatenation is not possible.
 func buildSPParam(ytCfg config.YouTubeConfig) string {
+	// Step 1: Check sort configuration first (sort takes priority over filters).
+	// YouTube search page only supports "relevance" (default, no sp param) and "popularity" (sp=CAM%3D).
+	sortBy := strings.ToLower(strings.TrimSpace(ytCfg.SearchPageSortBy))
+	if sortBy != "" && sortBy != "relevance" {
+		switch sortBy {
+		case "popularity":
+			return "CAM%3D"
+		default:
+			log.Printf("WARN: [youtube] unknown search_page_sort_by value: %q, ignoring", ytCfg.SearchPageSortBy)
+		}
+	}
+
+	// Step 2: Apply filter parameters (only when no sort override).
 	// Common sp values for YouTube search filters.
 	// These are pre-computed base64-encoded protobuf values.
 	switch {

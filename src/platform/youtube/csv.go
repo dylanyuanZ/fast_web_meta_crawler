@@ -46,6 +46,12 @@ func AuthorInfoToRow(info *AuthorInfo) []string {
 	if !info.JoinDate.IsZero() {
 		joinDate = info.JoinDate.Format("2006-01-02")
 	}
+	// Format external links as Excel HYPERLINK formulas for clickable links.
+	hyperlinks := make([]string, 0, len(info.ExternalLinks))
+	for _, link := range info.ExternalLinks {
+		hyperlinks = append(hyperlinks, fmt.Sprintf(`=HYPERLINK("%s","%s")`, link, link))
+	}
+
 	return []string{
 		info.Name,
 		info.ChannelID,
@@ -56,6 +62,6 @@ func AuthorInfoToRow(info *AuthorInfo) []string {
 		joinDate,
 		info.Region,
 		info.Description,
-		strings.Join(info.ExternalLinks, "\n"),
+		strings.Join(hyperlinks, "\n"),
 	}
 }
