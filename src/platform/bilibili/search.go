@@ -15,14 +15,12 @@ import (
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/pool"
 )
 
-// BiliBrowserSearchCrawler implements src.SearchRecorder (and legacy src.SearchCrawler)
-// using browser automation.
+// BiliBrowserSearchCrawler implements src.SearchRecorder using browser automation.
 type BiliBrowserSearchCrawler struct {
 	manager *browser.Manager
 }
 
-// Compile-time interface checks.
-var _ src.SearchCrawler = (*BiliBrowserSearchCrawler)(nil)
+// Compile-time interface check.
 var _ src.SearchRecorder = (*BiliBrowserSearchCrawler)(nil)
 
 // NewSearchCrawler creates a new BiliBrowserSearchCrawler.
@@ -54,8 +52,8 @@ func VideoHeader() []string {
 	}
 }
 
-// VideoToRow converts a src.Video to a CSV row matching VideoHeader columns.
-func VideoToRow(video src.Video) []string {
+// VideoToRow converts a Video to a CSV row matching VideoHeader columns.
+func VideoToRow(video Video) []string {
 	return []string{
 		video.Title,
 		video.Author,
@@ -131,7 +129,7 @@ func (c *BiliBrowserSearchCrawler) SearchAndRecord(ctx context.Context, keyword 
 	totalVideos := len(firstVideos)
 	if len(remainingPages) > 0 {
 		poolResults := pool.Run(ctx, cfg.GetPlatformConcurrency("bilibili"), remainingPages,
-			func(ctx context.Context, page int) ([]src.Video, error) {
+			func(ctx context.Context, page int) ([]Video, error) {
 				videos, _, err := c.searchPage(ctx, keyword, page)
 				if err != nil {
 					return nil, err
@@ -171,7 +169,7 @@ func (c *BiliBrowserSearchCrawler) SearchAndRecord(ctx context.Context, keyword 
 }
 
 // videosToRows converts a slice of Videos to CSV rows.
-func videosToRows(videos []src.Video) [][]string {
+func videosToRows(videos []Video) [][]string {
 	rows := make([][]string, 0, len(videos))
 	for _, v := range videos {
 		rows = append(rows, VideoToRow(v))
@@ -181,7 +179,7 @@ func videosToRows(videos []src.Video) [][]string {
 
 // searchPage opens Bilibili search page and extracts search results from Pinia SSR data.
 // This is the internal implementation used by SearchAndRecord.
-func (c *BiliBrowserSearchCrawler) searchPage(ctx context.Context, keyword string, page int) ([]src.Video, src.PageInfo, error) {
+func (c *BiliBrowserSearchCrawler) searchPage(ctx context.Context, keyword string, page int) ([]Video, src.PageInfo, error) {
 	p := c.manager.GetPage()
 	defer c.manager.PutPage(p)
 
@@ -205,9 +203,9 @@ func (c *BiliBrowserSearchCrawler) searchPage(ctx context.Context, keyword strin
 	}
 
 	// Convert to common types.
-	videos := make([]src.Video, 0, len(data.Result))
+	videos := make([]Video, 0, len(data.Result))
 	for _, item := range data.Result {
-		videos = append(videos, src.Video{
+		videos = append(videos, Video{
 			Title:     stripHTMLTags(item.Title),
 			Author:    item.Author,
 			AuthorID:  strconv.FormatInt(item.Mid, 10),
@@ -225,10 +223,4 @@ func (c *BiliBrowserSearchCrawler) searchPage(ctx context.Context, keyword strin
 
 	log.Printf("INFO: [bilibili] Search page %d: %d videos found (total pages: %d)", page, len(videos), pageInfoResult.TotalPages)
 	return videos, pageInfoResult, nil
-}
-
-// SearchPage is the legacy interface method for backward compatibility.
-// Deprecated: use SearchAndRecord instead.
-func (c *BiliBrowserSearchCrawler) SearchPage(ctx context.Context, keyword string, page int) ([]src.Video, src.PageInfo, error) {
-	return c.searchPage(ctx, keyword, page)
 }

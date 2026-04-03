@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // videoPageSize is the Bilibili default page size for video list API in browser mode.
@@ -169,4 +170,37 @@ func parseDuration(s string) int {
 	}
 
 	return int(math.Abs(float64(total)))
+}
+
+// ==================== Business Types (Bilibili-specific) ====================
+
+// Video represents a single Bilibili video from search results (stage 0 output).
+type Video struct {
+	Title     string    // video title
+	Author    string    // author display name
+	AuthorID  string    // Bilibili mid
+	PlayCount int64     // view/play count
+	PubDate   time.Time // publish date
+	Duration  int       // duration in seconds
+	Source    string    // platform name, always "bilibili"
+}
+
+// AuthorInfo holds basic Bilibili author profile data returned by the author info API.
+type AuthorInfo struct {
+	Name           string // author display name
+	Followers      int64  // follower count
+	TotalLikes     int64  // total likes across all content (from upstat API)
+	TotalPlayCount int64  // total play count across all videos (from upstat API)
+	VideoCount     int    // total video count (from arc/search API page.count)
+}
+
+// VideoDetail holds detailed video data returned by the author's video list API.
+// Used internally by author crawling for statistics calculation.
+type VideoDetail struct {
+	Title        string    // video title
+	BvID         string    // Bilibili BV ID (for URL generation)
+	PlayCount    int64     // view/play count
+	CommentCount int64     // comment count
+	Duration     int       // duration in seconds
+	PubDate      time.Time // publish date
 }

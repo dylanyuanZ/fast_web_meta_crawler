@@ -10,12 +10,12 @@ import (
 
 // Default values for configuration parameters.
 const (
-	DefaultMaxSearchVideos        = 100
-	DefaultMaxVideoPerAuthor      = 1000
-	DefaultConcurrency            = 3
+	DefaultMaxSearchVideos        = 200
+	DefaultMaxVideoPerAuthor      = 100
+	DefaultConcurrency            = 1
 	DefaultMaxConsecutiveFailures = 10
 	DefaultOutputDir              = "data/"
-	DefaultRequestInterval        = 500 * time.Millisecond
+	DefaultRequestInterval        = 2500 * time.Millisecond
 	DefaultBrowserHeadless        = true
 	DefaultBrowserUserDataDir     = "data/browser-profile/"
 )

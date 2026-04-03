@@ -25,12 +25,6 @@ type AuthorMid struct {
 	ID   string `json:"id"`   // platform-specific user ID (e.g. Bilibili mid)
 }
 
-// SearchCrawler defines the platform-specific search capability.
-// Deprecated: use SearchRecorder instead.
-type SearchCrawler interface {
-	SearchPage(ctx context.Context, keyword string, page int) ([]Video, PageInfo, error)
-}
-
 // SearchRecorder defines the platform-specific search + record capability.
 // Each platform implements this interface to provide keyword-based video search
 // with integrated CSV writing.

@@ -1,22 +1,31 @@
-# Search configuration
-max_search_page: 50          # max pages to search (1-50)
-max_video_per_author: 1000   # max videos to collect per author
+# Global search configuration
+max_search_videos: 200       # max videos to search (1-10000, replaces max_search_page)
+max_video_per_author: 100      # max videos to collect per author
 
-# Concurrency configuration
-concurrency: 2               # Worker Pool concurrency level (= browser Tab count, recommended 2; higher values may trigger 412 anti-crawl)
-request_interval: 2500ms     # Delay between requests per worker (anti-crawl safe interval)
+# Global concurrency configuration (used as fallback for per-platform settings)
+concurrency: 1               # Worker Pool concurrency level (1 = safest for anti-crawl)
+request_interval: 2500ms     # delay between requests per worker (anti-crawl)
+max_consecutive_failures: 10 # consecutive failures before aborting
 
 # Browser configuration
 browser:
-  headless: true                       # headless mode (server must be true, set false for local GUI login)
-  user_data_dir: "data/browser-profile/" # browser profile directory for login state persistence
-
-# Circuit breaker configuration
-max_consecutive_failures: 10 # consecutive failures before aborting
+  headless: true             # headless mode (set false to see browser UI)
+  user_data_dir: "data/browser-profile/"  # browser profile directory for login persistence
+  bin: "/usr/bin/google-chrome"  # custom browser binary path (skip auto-download if set)
 
 # Output configuration
 output_dir: "data/"          # CSV output directory
 
-# Cookie configuration (headless mode fallback when user_data_dir has no login state)
-# How to get cookie: open bilibili.com in browser → F12 → Network → copy Cookie header value
-cookie: ""
+# Per-platform configuration
+platform:
+  bilibili:
+    cookie: "buvid3=1AC80929-140F-B23C-8D60-72FCD7FAFE7618047infoc; b_nut=1772251618; _uuid=F848E5F10-1BDB-9898-54610-2C7106F22F6F318800infoc; CURRENT_QUALITY=0; rpdid=|(k||Yuklkl)0J'u~~kkluYum; buvid4=20D49B68-576F-6AF0-97F0-7B96BCD71A1318807-026022812-0geVHKbVIx+Sp45GB1xGpA%3D%3D; theme-tip-show=SHOWED; theme-avatar-tip-show=SHOWED; hit-dyn-v2=1; fingerprint=562e7c2470d4bcec7ff6ad45c468dbdb; buvid_fp_plain=undefined; buvid_fp=562e7c2470d4bcec7ff6ad45c468dbdb; SESSDATA=c9c2368e%2C1788681060%2C83112%2A32CjBrr7cNMJjfgUTdTUqqR1Bnr_ThHMHihFf-5ybTgvQVzV5htl7wAFwMGqRA-X6XbqESVjVWa2RNZEw0dHlYTno0RklTOXVleXM1aW9nbkRuRFZpM0NGcXI0dW9rUjR4XzMxV1pDYVVwanU1RDNpelNzeWI0NV8zU1o0NWxDZDhIMzRKLVFTcGRRIIEC; bili_jct=bc7d297e06dbb4f81595e3065874e811; DedeUserID=31066357; DedeUserID__ckMd5=5cfcca90763e46a3; home_feed_column=5; sid=8cdgskbl; bsource=search_google; bili_ticket=eyJhbGciOiJIUzI1NiIsImtpZCI6InMwMyIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NzQ3ODUzODEsImlhdCI6MTc3NDUyNjEyMSwicGx0IjotMX0.8gDVaz7tvclOGJ3QZGcaAoswVhO1wbGshoUe6xEFQZA; bili_ticket_expires=1774785321; browser_resolution=1498-895; bp_t_offset_31066357=1184082815189254144; CURRENT_FNVAL=4048; b_lsid=8D285C94_19D2D750D05"
+    concurrency: 3            # Bilibili concurrency (overrides global)
+    request_interval: 500ms   # Bilibili request interval (overrides global)
+  youtube:
+    filter_type: "video"       # "video" or "short" (empty = all)
+    # filter_duration: "medium"  # "short" (<4min), "medium" (4-20min), "long" (>20min)
+    filter_upload: "week"          # "today", "week", "month", "year"
+    # sort_by: "relevance"       # "relevance", "date", "view_count", "rating"
+    concurrency: 1            # YouTube concurrency (overrides global, strict anti-crawl)
+    request_interval: 2500ms  # YouTube request interval (overrides global)

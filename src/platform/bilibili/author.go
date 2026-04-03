@@ -127,7 +127,7 @@ func (c *BiliBrowserAuthorCrawler) FetchAuthorInfo(ctx context.Context, mid stri
 		upStatResp.Data.Likes, upStatResp.Data.Archive.View, videoListResp.Data.Page.Count)
 
 	// Build author info and convert to CSV row.
-	info := &src.AuthorInfo{
+	info := &AuthorInfo{
 		Name:           infoResp.Data.Name,
 		Followers:      statResp.Data.Follower,
 		TotalLikes:     upStatResp.Data.Likes,
@@ -140,7 +140,7 @@ func (c *BiliBrowserAuthorCrawler) FetchAuthorInfo(ctx context.Context, mid stri
 
 // AuthorInfoToBasicRow converts AuthorInfo to a basic CSV row (Stage 1).
 // Matches AuthorBasicHeader() columns.
-func AuthorInfoToBasicRow(info *src.AuthorInfo, mid string) []string {
+func AuthorInfoToBasicRow(info *AuthorInfo, mid string) []string {
 	avgPlay := safeDiv(float64(info.TotalPlayCount), float64(info.VideoCount))
 	avgLike := safeDiv(float64(info.TotalLikes), float64(info.VideoCount))
 	return []string{
@@ -232,7 +232,7 @@ func (c *BiliBrowserAuthorCrawler) FetchAllAuthorVideos(ctx context.Context, mid
 	if maxVideos < capacity {
 		capacity = maxVideos
 	}
-	allVideos := make([]src.VideoDetail, 0, capacity)
+	allVideos := make([]VideoDetail, 0, capacity)
 	allVideos = append(allVideos, firstVideos...)
 
 	// Step 2: Click "next page" to fetch remaining pages within the same tab.
@@ -308,7 +308,7 @@ func (c *BiliBrowserAuthorCrawler) FetchAllAuthorVideos(ctx context.Context, mid
 }
 
 // videoDetailsToRows converts VideoDetail slice to CSV rows.
-func videoDetailsToRows(videos []src.VideoDetail) [][]string {
+func videoDetailsToRows(videos []VideoDetail) [][]string {
 	rows := make([][]string, 0, len(videos))
 	for _, v := range videos {
 		rows = append(rows, []string{
@@ -316,7 +316,6 @@ func videoDetailsToRows(videos []src.VideoDetail) [][]string {
 			v.BvID,
 			fmt.Sprintf("%d", v.PlayCount),
 			fmt.Sprintf("%d", v.CommentCount),
-			fmt.Sprintf("%d", v.LikeCount),
 			fmt.Sprintf("%d", v.Duration),
 			v.PubDate.Format("2006-01-02 15:04:05"),
 		})
@@ -339,14 +338,14 @@ func MergeAuthorRow(infoRow []string, videoRows [][]string) []string {
 	var videosForTop []videoForTop
 
 	for _, row := range videoRows {
-		if len(row) < 7 {
+		if len(row) < 6 {
 			continue
 		}
 		var play, comment int64
 		var dur int
 		fmt.Sscanf(row[2], "%d", &play)
 		fmt.Sscanf(row[3], "%d", &comment)
-		fmt.Sscanf(row[5], "%d", &dur)
+		fmt.Sscanf(row[4], "%d", &dur)
 		totalPlay += play
 		totalComment += comment
 		totalDuration += dur
@@ -404,7 +403,7 @@ func MergeAuthorRow(infoRow []string, videoRows [][]string) []string {
 }
 
 // parseVideoListResponse parses a video list API response body into common types.
-func (c *BiliBrowserAuthorCrawler) parseVideoListResponse(body []byte, mid string, page int) ([]src.VideoDetail, src.PageInfo, error) {
+func (c *BiliBrowserAuthorCrawler) parseVideoListResponse(body []byte, mid string, page int) ([]VideoDetail, src.PageInfo, error) {
 	var resp VideoListResp
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, src.PageInfo{}, fmt.Errorf("parse video list mid=%s page=%d: %w", mid, page, err)
@@ -413,14 +412,13 @@ func (c *BiliBrowserAuthorCrawler) parseVideoListResponse(body []byte, mid strin
 		return nil, src.PageInfo{}, fmt.Errorf("video list API error mid=%s page=%d (code=%d, message=%s)", mid, page, resp.Code, resp.Message)
 	}
 
-	videos := make([]src.VideoDetail, 0, len(resp.Data.List.Vlist))
+	videos := make([]VideoDetail, 0, len(resp.Data.List.Vlist))
 	for _, item := range resp.Data.List.Vlist {
-		videos = append(videos, src.VideoDetail{
+		videos = append(videos, VideoDetail{
 			Title:        item.Title,
 			BvID:         item.BvID,
 			PlayCount:    item.Play,
 			CommentCount: item.Comment,
-			LikeCount:    0,
 			Duration:     parseDuration(item.Length),
 			PubDate:      time.Unix(item.Created, 0),
 		})
