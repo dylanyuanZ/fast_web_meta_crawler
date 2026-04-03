@@ -147,7 +147,7 @@ func processOneAuthorProbe(ctx context.Context, crawler *bilibili.BiliBrowserAut
 	start := time.Now()
 
 	// Phase 1: FetchAuthorInfo
-	info, err := crawler.FetchAuthorInfo(ctx, mid.ID)
+	infoRow, err := crawler.FetchAuthorInfo(ctx, mid.ID)
 	if err != nil {
 		errStr := err.Error()
 		status := "error"
@@ -166,11 +166,17 @@ func processOneAuthorProbe(ctx context.Context, crawler *bilibili.BiliBrowserAut
 		}
 	}
 
+	// Extract author name from the info row (first column).
+	authorName := mid.Name
+	if len(infoRow) > 0 {
+		authorName = infoRow[0]
+	}
+
 	// Brief pause between info and videos (same as production code).
 	time.Sleep(500 * time.Millisecond)
 
 	// Phase 2: FetchAllAuthorVideos
-	videos, _, err := crawler.FetchAllAuthorVideos(ctx, mid.ID, maxVideos)
+	videos, err := crawler.FetchAllAuthorVideos(ctx, mid.ID, maxVideos)
 	if err != nil {
 		errStr := err.Error()
 		status := "error"
@@ -180,7 +186,7 @@ func processOneAuthorProbe(ctx context.Context, crawler *bilibili.BiliBrowserAut
 		return authorResult{
 			Index:     index,
 			MID:       mid.ID,
-			Name:      info.Name,
+			Name:      authorName,
 			Phase:     "videos",
 			Status:    status,
 			Videos:    0,
@@ -193,7 +199,7 @@ func processOneAuthorProbe(ctx context.Context, crawler *bilibili.BiliBrowserAut
 	return authorResult{
 		Index:     index,
 		MID:       mid.ID,
-		Name:      info.Name,
+		Name:      authorName,
 		Phase:     "complete",
 		Status:    "ok",
 		Videos:    len(videos),

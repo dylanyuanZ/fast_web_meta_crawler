@@ -9,64 +9,57 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/dylanyuanZ/fast_web_meta_crawler/src/config"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/pool"
 )
 
 // PageInfo carries pagination metadata returned by API responses.
-// Avoids a separate TotalPages() method — the first SearchPage/FetchAllAuthorVideos
-// call naturally returns this info as part of the response.
 type PageInfo struct {
 	TotalPages int // total pages available
 	TotalCount int // total items available
 }
 
 // AuthorMid represents a unique author identifier, passed from stage 0 to stage 1.
-// Also used as the intermediate data file format.
 type AuthorMid struct {
 	Name string `json:"name"` // author display name (for logging/progress)
 	ID   string `json:"id"`   // platform-specific user ID (e.g. Bilibili mid)
 }
 
 // SearchCrawler defines the platform-specific search capability.
-// Each platform implements this interface to provide keyword-based video search.
+// Deprecated: use SearchRecorder instead.
 type SearchCrawler interface {
-	// SearchPage fetches a single page of search results for the given keyword.
-	// Returns the videos found on that page and pagination info.
-	// The caller uses PageInfo.TotalPages (from the first call) to decide how many
-	// pages to fetch in total (capped by config.max_search_page).
 	SearchPage(ctx context.Context, keyword string, page int) ([]Video, PageInfo, error)
 }
 
-// AuthorCrawler defines the platform-specific author detail capability.
-// Each platform implements this interface to provide author info and video list fetching.
-type AuthorCrawler interface {
-	// FetchAuthorInfo fetches basic author info (name, followers, region, etc.).
-	FetchAuthorInfo(ctx context.Context, mid string) (*AuthorInfo, error)
-
-	// FetchAllAuthorVideos navigates to the author's video page and fetches all videos
-	// by paginating from page 1 to the last page (or until maxVideos is reached).
-	// Internally handles pagination (e.g. clicking "next page" in SPA) within a single
-	// browser tab, avoiding repeated navigation.
-	FetchAllAuthorVideos(ctx context.Context, mid string, maxVideos int) ([]VideoDetail, PageInfo, error)
+// SearchRecorder defines the platform-specific search + record capability.
+// Each platform implements this interface to provide keyword-based video search
+// with integrated CSV writing.
+type SearchRecorder interface {
+	SearchAndRecord(ctx context.Context, keyword string, csvWriter CSVRowWriter, progress ProgressTracker) (int, error)
 }
 
-// RunStage0 orchestrates stage 0: search → paginate → collect → deduplicate → export CSV.
-// Each page's videos are written to CSV immediately after fetching (real-time persistence).
-// Internally calls SearchCrawler.SearchPage via Worker Pool.
-// Returns the AuthorMid list for stage 1 consumption.
-func RunStage0(ctx context.Context, sc SearchCrawler, keyword string, cfg Stage0Config) ([]AuthorMid, error) {
+// AuthorCrawler defines the platform-specific author detail capability.
+type AuthorCrawler interface {
+	// FetchAuthorInfo fetches basic author info and returns it as a CSV row.
+	FetchAuthorInfo(ctx context.Context, mid string) ([]string, error)
+
+	// FetchAllAuthorVideos fetches all videos for an author and returns them as CSV rows.
+	FetchAllAuthorVideos(ctx context.Context, mid string, maxVideos int) ([][]string, error)
+}
+
+// RunStage0 orchestrates stage 0: search → record → deduplicate → export.
+// The search+record logic is delegated to the platform's SearchRecorder.
+func RunStage0(ctx context.Context, sr SearchRecorder, keyword string, cfg Stage0Config) ([]AuthorMid, error) {
 	start := time.Now()
 	log.Printf("INFO: Stage 0 started, keyword=%q", keyword)
 
-	// Step 1: Create or open VideoCSVWriter.
-	var csvWriter VideoCSVRowWriter
+	// Step 1: Create or open CSVWriter.
+	var csvWriter CSVRowWriter
 	var err error
 	if cfg.ExistingVideoCSVPath != "" {
-		// Resume: open existing CSV in append mode (no header).
-		csvWriter, err = cfg.OpenVideoCSVWriter(cfg.ExistingVideoCSVPath)
+		csvWriter, err = cfg.OpenCSVWriter(cfg.ExistingVideoCSVPath)
 	} else {
-		// First run: create new CSV with BOM + header.
-		csvWriter, err = cfg.NewVideoCSVWriter(cfg.OutputDir, cfg.Platform, keyword)
+		csvWriter, err = cfg.NewCSVWriter(cfg.OutputDir, cfg.Platform, keyword)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("create/open video CSV writer: %w", err)
@@ -80,116 +73,32 @@ func RunStage0(ctx context.Context, sc SearchCrawler, keyword string, cfg Stage0
 		}
 	}
 
-	// Step 3: Fetch first page to get total pages.
-	firstVideos, pageInfo, err := sc.SearchPage(ctx, keyword, 1)
+	// Step 3: Delegate search+record to platform.
+	totalVideos, err := sr.SearchAndRecord(ctx, keyword, csvWriter, cfg.Progress)
 	if err != nil {
-		return nil, fmt.Errorf("fetch first page: %w", err)
+		return nil, fmt.Errorf("search and record: %w", err)
 	}
 
-	actualPages := pageInfo.TotalPages
-	if actualPages > cfg.MaxSearchPage {
-		actualPages = cfg.MaxSearchPage
-	}
-	log.Printf("INFO: Search found %d total pages, will fetch %d pages", pageInfo.TotalPages, actualPages)
-
-	completedPages := make(map[int]bool)
-	if cfg.Progress != nil {
-		completedPages = cfg.Progress.CompletedPages()
-	}
-
-	// Write first page videos to CSV immediately (only if not already completed in a previous run).
-	if !completedPages[1] {
-		if writeErr := csvWriter.WriteRows(firstVideos); writeErr != nil {
-			log.Printf("WARN: failed to write first page videos to CSV: %v", writeErr)
-		}
-	}
-
-	// Record first page progress only if not already completed.
-	if !completedPages[1] {
-		completedPages[1] = true
-		if cfg.Progress != nil {
-			if err := cfg.Progress.AddSearchPage(cfg.OutputDir, 1); err != nil {
-				log.Printf("WARN: failed to save progress for page 1: %v", err)
-			}
-		}
-	}
-
-	// Step 4: Build remaining page tasks (skip already completed pages).
-	var remainingPages []int
-	for p := 2; p <= actualPages; p++ {
-		if !completedPages[p] {
-			remainingPages = append(remainingPages, p)
-		}
-	}
-
-	// Step 5: Worker Pool for remaining pages — worker writes to CSV immediately.
-	successCount := 1 // first page already succeeded
-	failCount := 0
-	if len(remainingPages) > 0 {
-		results := cfg.PoolRun(ctx, cfg.Concurrency, remainingPages,
-			func(ctx context.Context, page int) ([]Video, error) {
-				videos, _, err := sc.SearchPage(ctx, keyword, page)
-				if err != nil {
-					return nil, err
-				}
-				// Write to CSV immediately (real-time persistence).
-				if writeErr := csvWriter.WriteRows(videos); writeErr != nil {
-					log.Printf("WARN: failed to write page %d videos to CSV: %v", page, writeErr)
-				}
-				// Record progress for this page.
-				if cfg.Progress != nil {
-					if saveErr := cfg.Progress.AddSearchPage(cfg.OutputDir, page); saveErr != nil {
-						log.Printf("WARN: failed to save progress for page %d: %v", page, saveErr)
-					}
-				}
-				return videos, nil
-			},
-			cfg.MaxConsecutiveFailures,
-			cfg.RequestInterval,
-		)
-
-		// Collect results (only for counting, data is already in CSV).
-		for _, r := range results {
-			if r.Err != nil {
-				failCount++
-				log.Printf("ERROR: Failed to fetch page %d: %v", r.Task, r.Err)
-			} else {
-				successCount++
-			}
-		}
-	}
-	log.Printf("INFO: [Stage 0] Pages: success=%d, failed=%d", successCount, failCount)
-
-	// Step 6: Close CSV writer before reading.
+	// Step 4: Close CSV writer before reading.
 	if err := csvWriter.Close(); err != nil {
 		log.Printf("WARN: failed to close video CSV writer: %v", err)
 	}
 
-	// Step 7: Read all videos from CSV for deduplication.
-	allVideos, err := cfg.ReadVideoCSV(csvWriter.FilePath())
+	// Step 5: Read CSV to extract unique authors.
+	mids, err := cfg.ReadVideoCSVAuthors(csvWriter.FilePath())
 	if err != nil {
 		return nil, fmt.Errorf("read video CSV for dedup: %w", err)
 	}
 
-	// Step 8: Deduplicate by AuthorID.
-	seen := make(map[string]bool)
-	var mids []AuthorMid
-	for _, v := range allVideos {
-		if v.AuthorID != "" && !seen[v.AuthorID] {
-			seen[v.AuthorID] = true
-			mids = append(mids, AuthorMid{Name: v.Author, ID: v.AuthorID})
-		}
-	}
-
-	log.Printf("INFO: [Stage 0] Total videos: %d, Unique authors: %d", len(allVideos), len(mids))
+	log.Printf("INFO: [Stage 0] Total videos: %d, Unique authors: %d", totalVideos, len(mids))
 	log.Printf("INFO: [Stage 0] Video CSV: %s", csvWriter.FilePath())
 
-	// Step 9: Write intermediate data file (author mids as JSON).
+	// Step 6: Write intermediate data file (author mids as JSON).
 	if err := writeIntermediateData(cfg.OutputDir, cfg.Platform, keyword, mids); err != nil {
 		return nil, fmt.Errorf("write intermediate data: %w", err)
 	}
 
-	// Step 10: Update progress to stage 1.
+	// Step 7: Update progress to stage 1.
 	if cfg.Progress != nil {
 		if err := cfg.Progress.SetAuthorMids(cfg.OutputDir, mids); err != nil {
 			log.Printf("WARN: failed to update progress to stage 1: %v", err)
@@ -202,10 +111,12 @@ func RunStage0(ctx context.Context, sc SearchCrawler, keyword string, cfg Stage0
 
 // RunStage1 orchestrates stage 1: iterate authors → fetch basic info → export CSV.
 // Stage 1 is lightweight: only calls FetchAuthorInfo, no video traversal.
-// No cooldown or retry — FetchAuthorInfo is a single page load with low risk control risk.
 func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stage1Config) error {
 	start := time.Now()
-	log.Printf("INFO: Stage 1 started, %d authors to process, concurrency=%d", len(mids), cfg.Concurrency)
+	concurrency := config.Get().GetPlatformConcurrency(cfg.Platform)
+	requestInterval := config.Get().GetPlatformRequestInterval(cfg.Platform)
+	maxConsecutiveFailures := config.Get().MaxConsecutiveFailures
+	log.Printf("INFO: Stage 1 started, %d authors to process, concurrency=%d", len(mids), concurrency)
 
 	if len(mids) == 0 {
 		log.Printf("INFO: [Stage 1] No authors to process, skipping")
@@ -213,12 +124,12 @@ func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 	}
 
 	// Step 1: Create or open CSVWriter.
-	var csvWriter AuthorCSVRowWriter
+	var csvWriter CSVRowWriter
 	var err error
 	if cfg.ExistingCSVPath != "" {
-		csvWriter, err = cfg.OpenAuthorCSVWriter(cfg.ExistingCSVPath)
+		csvWriter, err = cfg.OpenCSVWriter(cfg.ExistingCSVPath)
 	} else {
-		csvWriter, err = cfg.NewAuthorCSVWriter(cfg.OutputDir, cfg.Platform, cfg.Keyword)
+		csvWriter, err = cfg.NewCSVWriter(cfg.OutputDir, cfg.Platform, cfg.Keyword)
 	}
 	if err != nil {
 		return fmt.Errorf("create/open author CSV writer: %w", err)
@@ -232,20 +143,21 @@ func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 		}
 	}
 
-	// Step 3: Worker Pool — no cooldown, no retry for Stage 1.
-	results := cfg.PoolRun(ctx, cfg.Concurrency, mids,
-		func(ctx context.Context, mid AuthorMid) (Author, error) {
-			author, err := processOneAuthorBasic(ctx, ac, mid)
+	// Step 3: Worker Pool — fetch author info and write to CSV.
+	results := cfg.PoolRun(ctx, concurrency, mids,
+		func(ctx context.Context, mid AuthorMid) ([]string, error) {
+			row, err := ac.FetchAuthorInfo(ctx, mid.ID)
 			if err != nil {
-				return Author{}, err
+				return nil, err
 			}
-			if writeErr := csvWriter.WriteRow(author); writeErr != nil {
+			if writeErr := csvWriter.WriteRow(row); writeErr != nil {
 				log.Printf("WARN: failed to write author %s to CSV: %v", mid.ID, writeErr)
 			}
-			return author, nil
+			log.Printf("INFO: Author %s (mid=%s) processed", mid.Name, mid.ID)
+			return row, nil
 		},
-		cfg.MaxConsecutiveFailures,
-		cfg.RequestInterval,
+		maxConsecutiveFailures,
+		requestInterval,
 	)
 
 	// Step 4: Collect and log results.
@@ -271,7 +183,11 @@ func RunStage1(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 // Stage 2 includes cooldown and retry for risk control resilience.
 func RunStage2(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stage2Config) error {
 	start := time.Now()
-	log.Printf("INFO: Stage 2 started, %d authors to process, concurrency=%d", len(mids), cfg.Concurrency)
+	concurrency := config.Get().GetPlatformConcurrency(cfg.Platform)
+	requestInterval := config.Get().GetPlatformRequestInterval(cfg.Platform)
+	maxConsecutiveFailures := config.Get().MaxConsecutiveFailures
+	maxVideoPerAuthor := config.Get().MaxVideoPerAuthor
+	log.Printf("INFO: Stage 2 started, %d authors to process, concurrency=%d", len(mids), concurrency)
 
 	if len(mids) == 0 {
 		log.Printf("INFO: [Stage 2] No authors to process, skipping")
@@ -279,12 +195,12 @@ func RunStage2(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 	}
 
 	// Step 1: Create or open CSVWriter.
-	var csvWriter AuthorCSVRowWriter
+	var csvWriter CSVRowWriter
 	var err error
 	if cfg.ExistingCSVPath != "" {
-		csvWriter, err = cfg.OpenAuthorCSVWriter(cfg.ExistingCSVPath)
+		csvWriter, err = cfg.OpenCSVWriter(cfg.ExistingCSVPath)
 	} else {
-		csvWriter, err = cfg.NewAuthorCSVWriter(cfg.OutputDir, cfg.Platform, cfg.Keyword)
+		csvWriter, err = cfg.NewCSVWriter(cfg.OutputDir, cfg.Platform, cfg.Keyword)
 	}
 	if err != nil {
 		return fmt.Errorf("create/open author CSV writer: %w", err)
@@ -305,31 +221,31 @@ func RunStage2(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 	}
 
 	// Step 4: Worker Pool with cooldown and retry.
-	results := cfg.PoolRun(ctx, cfg.Concurrency, mids,
-		func(ctx context.Context, mid AuthorMid) (Author, error) {
+	results := cfg.PoolRun(ctx, concurrency, mids,
+		func(ctx context.Context, mid AuthorMid) ([]string, error) {
 			cd.Wait(ctx)
 			if ctx.Err() != nil {
-				return Author{}, ctx.Err()
+				return nil, ctx.Err()
 			}
 
-			author, err := retryWithCooldown(ctx, 3, cd,
+			row, err := retryWithCooldown(ctx, 3, cd,
 				fmt.Sprintf("author %s (mid=%s)", mid.Name, mid.ID),
-				func() (Author, error) {
-					return processOneAuthorFull(ctx, ac, mid, cfg)
+				func() ([]string, error) {
+					return processOneAuthorFull(ctx, ac, mid, cfg, maxVideoPerAuthor, requestInterval)
 				},
 				cfg.IsRetryableError,
 			)
 			if err != nil {
-				return Author{}, err
+				return nil, err
 			}
 
-			if writeErr := csvWriter.WriteRow(author); writeErr != nil {
+			if writeErr := csvWriter.WriteRow(row); writeErr != nil {
 				log.Printf("WARN: failed to write author %s to CSV: %v", mid.ID, writeErr)
 			}
-			return author, nil
+			return row, nil
 		},
-		cfg.MaxConsecutiveFailures,
-		cfg.RequestInterval,
+		maxConsecutiveFailures,
+		requestInterval,
 	)
 
 	// Step 5: Collect and log results.
@@ -352,9 +268,6 @@ func RunStage2(ctx context.Context, ac AuthorCrawler, mids []AuthorMid, cfg Stag
 }
 
 // retryWithCooldown retries a function up to maxRetries times with exponential backoff.
-// On retryable errors, triggers global cooldown so all workers pause.
-// Non-retryable errors are returned immediately without retry.
-// The isRetryable function is platform-specific and injected by the caller.
 func retryWithCooldown[T any](
 	ctx context.Context,
 	maxRetries int,
@@ -395,66 +308,40 @@ func retryWithCooldown[T any](
 	return zero, fmt.Errorf("all %d retries exhausted for %s: %w", maxRetries, label, lastErr)
 }
 
-// processOneAuthorBasic fetches only basic author info (Stage 1 path).
-// No video traversal, no stats calculation.
-func processOneAuthorBasic(ctx context.Context, ac AuthorCrawler, mid AuthorMid) (Author, error) {
-	info, err := ac.FetchAuthorInfo(ctx, mid.ID)
-	if err != nil {
-		return Author{}, fmt.Errorf("fetch author info: %w", err)
-	}
-
-	author := Author{
-		Name:           info.Name,
-		ID:             mid.ID,
-		Followers:      info.Followers,
-		VideoCount:     info.VideoCount,
-		TotalLikes:     info.TotalLikes,
-		TotalPlayCount: info.TotalPlayCount,
-	}
-
-	log.Printf("INFO: Author %s (mid=%s): followers=%d, videos=%d",
-		info.Name, mid.ID, info.Followers, info.VideoCount)
-	return author, nil
-}
-
-// processOneAuthorFull fetches author info + all videos + stats (Stage 2 path).
-func processOneAuthorFull(ctx context.Context, ac AuthorCrawler, mid AuthorMid, cfg Stage2Config) (Author, error) {
+// processOneAuthorFull fetches author info + all videos and merges them into a single CSV row.
+// The platform's FetchAuthorInfo returns the base row, and FetchAllAuthorVideos returns
+// additional video detail rows. The MergeAuthorRow function combines them.
+func processOneAuthorFull(ctx context.Context, ac AuthorCrawler, mid AuthorMid, cfg Stage2Config, maxVideoPerAuthor int, requestInterval time.Duration) ([]string, error) {
 	authorStart := time.Now()
 
-	// Step 1: Fetch author info.
-	info, err := ac.FetchAuthorInfo(ctx, mid.ID)
+	// Step 1: Fetch author info (returns CSV row).
+	infoRow, err := ac.FetchAuthorInfo(ctx, mid.ID)
 	if err != nil {
-		return Author{}, fmt.Errorf("fetch author info: %w", err)
+		return nil, fmt.Errorf("fetch author info: %w", err)
 	}
 
 	// Brief pause between API calls with jitter.
-	if cfg.RequestInterval > 0 {
-		time.Sleep(pool.JitteredDuration(cfg.RequestInterval))
+	if requestInterval > 0 {
+		time.Sleep(pool.JitteredDuration(requestInterval))
 	}
 
-	// Step 2: Fetch all videos.
-	allVideos, pageInfo, err := ac.FetchAllAuthorVideos(ctx, mid.ID, cfg.MaxVideoPerAuthor)
+	// Step 2: Fetch all videos (returns CSV rows).
+	videoRows, err := ac.FetchAllAuthorVideos(ctx, mid.ID, maxVideoPerAuthor)
 	if err != nil {
-		return Author{}, fmt.Errorf("fetch author videos: %w", err)
+		return nil, fmt.Errorf("fetch author videos: %w", err)
 	}
 
-	// Step 3: Calculate stats.
-	stats, topVideos := cfg.CalcAuthorStats(allVideos, 3)
-
-	author := Author{
-		Name:           info.Name,
-		ID:             mid.ID,
-		Followers:      info.Followers,
-		VideoCount:     pageInfo.TotalCount,
-		TotalLikes:     info.TotalLikes,
-		TotalPlayCount: info.TotalPlayCount,
-		Stats:          stats,
-		TopVideos:      topVideos,
+	// Step 3: Merge info + video stats into final row.
+	var finalRow []string
+	if cfg.MergeAuthorRow != nil {
+		finalRow = cfg.MergeAuthorRow(infoRow, videoRows)
+	} else {
+		finalRow = infoRow
 	}
 
 	log.Printf("INFO: Author %s: %d videos fetched, %v",
-		info.Name, len(allVideos), time.Since(authorStart).Round(time.Millisecond))
-	return author, nil
+		mid.Name, len(videoRows), time.Since(authorStart).Round(time.Millisecond))
+	return finalRow, nil
 }
 
 // ==================== Configuration structs for dependency injection ====================
@@ -473,66 +360,46 @@ type PoolResult[T any, R any] struct {
 
 // Stage0Config holds dependencies for RunStage0, enabling testability.
 type Stage0Config struct {
-	Platform               string
-	OutputDir              string
-	MaxSearchPage          int
-	Concurrency            int
-	MaxConsecutiveFailures int
-	RequestInterval        time.Duration
-	Progress               ProgressTracker
-	PoolRun                PoolRunFunc[int, []Video]
-	NewVideoCSVWriter      func(outputDir, platform, keyword string) (VideoCSVRowWriter, error)
-	OpenVideoCSVWriter     func(existingPath string) (VideoCSVRowWriter, error)
-	ReadVideoCSV           func(csvPath string) ([]Video, error)
-	ExistingVideoCSVPath   string // non-empty when resuming from a previous run
+	Platform             string
+	OutputDir            string
+	Progress             ProgressTracker
+	NewCSVWriter         func(outputDir, platform, keyword string) (CSVRowWriter, error)
+	OpenCSVWriter        func(existingPath string) (CSVRowWriter, error)
+	ReadVideoCSVAuthors  func(csvPath string) ([]AuthorMid, error)
+	ExistingVideoCSVPath string // non-empty when resuming from a previous run
 }
 
 // Stage1Config holds dependencies for RunStage1 (basic author info, no video traversal).
 type Stage1Config struct {
-	Platform               string
-	Keyword                string
-	OutputDir              string
-	Concurrency            int
-	MaxConsecutiveFailures int
-	RequestInterval        time.Duration
-	Progress               ProgressTracker
-	PoolRun                PoolRunFunc[AuthorMid, Author]
-	NewAuthorCSVWriter     func(outputDir, platform, keyword string) (AuthorCSVRowWriter, error)
-	OpenAuthorCSVWriter    func(existingPath string) (AuthorCSVRowWriter, error)
-	ExistingCSVPath        string // non-empty when resuming from a previous run
+	Platform        string
+	Keyword         string
+	OutputDir       string
+	Progress        ProgressTracker
+	PoolRun         PoolRunFunc[AuthorMid, []string]
+	NewCSVWriter    func(outputDir, platform, keyword string) (CSVRowWriter, error)
+	OpenCSVWriter   func(existingPath string) (CSVRowWriter, error)
+	ExistingCSVPath string // non-empty when resuming from a previous run
 }
 
 // Stage2Config holds dependencies for RunStage2 (full author info with video traversal).
 type Stage2Config struct {
-	Platform               string
-	Keyword                string
-	OutputDir              string
-	Concurrency            int
-	MaxVideoPerAuthor      int
-	MaxConsecutiveFailures int
-	RequestInterval        time.Duration
-	Progress               ProgressTracker
-	PoolRun                PoolRunFunc[AuthorMid, Author]
-	NewAuthorCSVWriter     func(outputDir, platform, keyword string) (AuthorCSVRowWriter, error)
-	OpenAuthorCSVWriter    func(existingPath string) (AuthorCSVRowWriter, error)
-	ExistingCSVPath        string // non-empty when resuming from a previous run
-	CalcAuthorStats        func(videos []VideoDetail, topN int) (AuthorStats, []TopVideo)
-	Cooldown               *pool.Cooldown       // global cooldown for risk control
-	IsRetryableError       func(err error) bool // platform-specific retryable error check
+	Platform         string
+	Keyword          string
+	OutputDir        string
+	Progress         ProgressTracker
+	PoolRun          PoolRunFunc[AuthorMid, []string]
+	NewCSVWriter     func(outputDir, platform, keyword string) (CSVRowWriter, error)
+	OpenCSVWriter    func(existingPath string) (CSVRowWriter, error)
+	ExistingCSVPath  string // non-empty when resuming from a previous run
+	MergeAuthorRow   func(infoRow []string, videoRows [][]string) []string
+	Cooldown         *pool.Cooldown
+	IsRetryableError func(err error) bool
 }
 
-// AuthorCSVRowWriter abstracts incremental CSV writing for author data.
-// Implemented by export.AuthorCSVWriter; defined here to avoid circular imports.
-type AuthorCSVRowWriter interface {
-	WriteRow(author Author) error
-	FilePath() string
-	Close() error
-}
-
-// VideoCSVRowWriter abstracts incremental CSV writing for video data.
-// Implemented by export.VideoCSVWriter; defined here to avoid circular imports.
-type VideoCSVRowWriter interface {
-	WriteRows(videos []Video) error
+// CSVRowWriter abstracts incremental CSV writing for generic row data.
+type CSVRowWriter interface {
+	WriteRow(row []string) error
+	WriteRows(rows [][]string) error
 	FilePath() string
 	Close() error
 }
@@ -548,12 +415,10 @@ type ProgressTracker interface {
 
 // ==================== Intermediate data file ====================
 
-// intermediateFileName returns the filename for the intermediate author mids data.
 func intermediateFileName(platform, keyword string) string {
 	return fmt.Sprintf("%s_%s_authors.json", platform, keyword)
 }
 
-// writeIntermediateData writes the deduplicated author mids to a JSON file.
 func writeIntermediateData(outputDir, platform, keyword string, mids []AuthorMid) error {
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return fmt.Errorf("create output dir: %w", err)

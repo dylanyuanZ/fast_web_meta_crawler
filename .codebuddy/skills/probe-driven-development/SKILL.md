@@ -74,3 +74,18 @@ description: 探针驱动开发方法论。当用户提及"探针反馈开发方
 | 用户信息 API URL | `/x/space/acc/info` | `/x/space/wbi/acc/info`（多了 `wbi/` 路径段） |
 | 视频列表翻页 | URL 参数 `?pn=N` 翻页 | URL 参数不影响 SPA 的 API 请求 pn 值，需点击"下一页"按钮 |
 | 视频列表 page size | 硬编码 50（后改 25） | 实际 API 返回 `ps=30`，应从响应中读取 |
+
+### YouTube（2026-04-02 实测）
+
+| 发现 | 原始假设 | 实测结果 |
+|------|---------|---------|
+| 搜索页渲染方式 | 未知 | SSR 渲染（`window.ytInitialData`），526KB，包含完整搜索结果 |
+| 搜索页筛选 | 需要点击筛选按钮 | 通过 URL 参数 `sp=` 直接拼接，零额外成本 |
+| 搜索页排序 | 用户认为"无排序" | 实测有 Relevance 和 Popularity 两种排序（也通过 `sp=` 控制） |
+| 频道元数据 | 全在"更多"弹窗里 | 粉丝数/视频数/handle 在 SSR 中直接可取；注册时间/总播放量/地区需额外 browse API |
+| 视频列表翻页 | 未知 | 滚动触发 continuation token，通过 `/youtubei/v1/browse` API 加载更多 |
+| 视频列表排序 | 需要点击排序按钮 | 通过 `chipBarViewModel` 的 continuation token 切换，不改变 URL |
+| "更多"弹窗数据 | 在 SSR 的 engagementPanel 中 | SSR 中 engagementPanels 为空，需点击描述区域触发 browse API，数据在 `aboutChannelViewModel` 中 |
+| 搜索页到底判断 | 未知 | `ytd-continuation-item-renderer` 消失 + `ytd-message-renderer` 出现 "No more results" |
+| 组合筛选参数 | 可以拼接 sp 值 | 不能拼接，必须从已筛选页面的 filter dialog 中提取组合后的 sp 值 |
+| Shorts tab 结构 | 与 Videos tab 一致 | 外层一致（richGridRenderer），但内容渲染器不同：Shorts 用 `shortsLockupViewModel`（无发布时间、无时长） |

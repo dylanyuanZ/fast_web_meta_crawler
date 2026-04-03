@@ -67,29 +67,3 @@ type Author struct {
 	Stats          AuthorStats // aggregated statistics
 	TopVideos      []TopVideo  // top 3 videos by play count
 }
-
-// ==================== CSV Adapter Interfaces ====================
-
-// AuthorCSVAdapter defines platform-specific CSV header and row conversion for author data.
-// Implemented by each platform package (e.g. bilibili/csv.go).
-// All methods are pure functions — safe for concurrent use.
-type AuthorCSVAdapter interface {
-	// BasicHeader returns the CSV header for Stage 1 (basic author info, no video traversal).
-	BasicHeader() []string
-	// BasicRow converts an Author to a CSV row matching BasicHeader columns.
-	BasicRow(author Author) []string
-	// FullHeader returns the CSV header for Stage 2 (full author info with video stats).
-	FullHeader() []string
-	// FullRow converts an Author to a CSV row matching FullHeader columns.
-	FullRow(author Author) []string
-}
-
-// VideoCSVAdapter defines platform-specific CSV header and row conversion for video data.
-// Implemented by each platform package (e.g. bilibili/csv.go).
-// All methods are pure functions — safe for concurrent use.
-type VideoCSVAdapter interface {
-	// Header returns the CSV header for video data.
-	Header() []string
-	// Row converts a Video to a CSV row matching Header columns.
-	Row(video Video) []string
-}

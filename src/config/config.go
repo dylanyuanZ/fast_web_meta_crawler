@@ -10,7 +10,7 @@ import (
 
 // Default values for configuration parameters.
 const (
-	DefaultMaxSearchPage          = 50
+	DefaultMaxSearchVideos        = 100
 	DefaultMaxVideoPerAuthor      = 1000
 	DefaultConcurrency            = 3
 	DefaultMaxConsecutiveFailures = 10
@@ -22,8 +22,8 @@ const (
 
 // Clamp boundaries.
 const (
-	MinMaxSearchPage     = 1
-	MaxMaxSearchPage     = 50
+	MinMaxSearchVideos   = 1
+	MaxMaxSearchVideos   = 10000
 	MinMaxVideoPerAuthor = 1
 	MaxMaxVideoPerAuthor = 5000
 	MinConcurrency       = 1
@@ -45,23 +45,52 @@ func (b BrowserConfig) IsHeadless() bool {
 	return *b.Headless
 }
 
+// BilibiliConfig holds Bilibili platform-specific configuration.
+type BilibiliConfig struct {
+	Cookie          string        `yaml:"cookie"`           // browser cookie for authenticated access
+	Concurrency     int           `yaml:"concurrency"`      // platform-level concurrency (0 = use global)
+	RequestInterval time.Duration `yaml:"request_interval"` // platform-level request interval (0 = use global)
+}
+
+// YouTubeConfig holds YouTube platform-specific configuration.
+type YouTubeConfig struct {
+	// Filter options for search (Stage 0).
+	FilterType      string        `yaml:"filter_type"`      // "video" or "short" (empty = all)
+	FilterDuration  string        `yaml:"filter_duration"`  // "short" (<4min), "medium" (4-20min), "long" (>20min)
+	FilterUpload    string        `yaml:"filter_upload"`    // "today", "week", "month", "year"
+	SortBy          string        `yaml:"sort_by"`          // "relevance", "date", "view_count", "rating"
+	Concurrency     int           `yaml:"concurrency"`      // platform-level concurrency (0 = use global)
+	RequestInterval time.Duration `yaml:"request_interval"` // platform-level request interval (0 = use global)
+}
+
+// PlatformConfig holds per-platform configuration.
+type PlatformConfig struct {
+	Bilibili BilibiliConfig `yaml:"bilibili"`
+	YouTube  YouTubeConfig  `yaml:"youtube"`
+}
+
 // Config holds all application configuration.
 type Config struct {
-	MaxSearchPage          int           `yaml:"max_search_page"`
+	// Global settings.
+	OutputDir string        `yaml:"output_dir"`
+	Browser   BrowserConfig `yaml:"browser"`
+
+	// Per-platform settings.
+	Platform PlatformConfig `yaml:"platform"`
+
+	// Global search/crawl settings.
+	MaxSearchVideos        int           `yaml:"max_search_videos"`
 	MaxVideoPerAuthor      int           `yaml:"max_video_per_author"`
 	Concurrency            int           `yaml:"concurrency"`
-	Browser                BrowserConfig `yaml:"browser"`
 	MaxConsecutiveFailures int           `yaml:"max_consecutive_failures"`
-	OutputDir              string        `yaml:"output_dir"`
-	Cookie                 string        `yaml:"cookie"`
 	RequestInterval        time.Duration `yaml:"request_interval"`
+	Cookie                 string        `yaml:"cookie"` // legacy: use platform.bilibili.cookie instead
 }
 
 // global holds the loaded configuration singleton.
 var global *Config
 
 // Load reads and parses the configuration file at the given path.
-// It fills in default values for missing fields and clamps out-of-range values.
 func Load(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -81,7 +110,6 @@ func Load(path string) error {
 }
 
 // Get returns the global configuration object.
-// Must be called after Load().
 func Get() *Config {
 	if global == nil {
 		log.Fatal("FATAL: config.Get() called before config.Load()")
@@ -89,10 +117,51 @@ func Get() *Config {
 	return global
 }
 
+// GetPlatformConcurrency returns the effective concurrency for the given platform.
+// Priority: platform config > global fallback.
+func (c *Config) GetPlatformConcurrency(platform string) int {
+	switch platform {
+	case "bilibili":
+		if c.Platform.Bilibili.Concurrency > 0 {
+			return c.Platform.Bilibili.Concurrency
+		}
+	case "youtube":
+		if c.Platform.YouTube.Concurrency > 0 {
+			return c.Platform.YouTube.Concurrency
+		}
+	}
+	return c.Concurrency
+}
+
+// GetPlatformRequestInterval returns the effective request interval for the given platform.
+// Priority: platform config > global fallback.
+func (c *Config) GetPlatformRequestInterval(platform string) time.Duration {
+	switch platform {
+	case "bilibili":
+		if c.Platform.Bilibili.RequestInterval > 0 {
+			return c.Platform.Bilibili.RequestInterval
+		}
+	case "youtube":
+		if c.Platform.YouTube.RequestInterval > 0 {
+			return c.Platform.YouTube.RequestInterval
+		}
+	}
+	return c.RequestInterval
+}
+
+// GetBilibiliCookie returns the effective Bilibili cookie.
+// Prefers platform.bilibili.cookie, falls back to legacy global cookie.
+func (c *Config) GetBilibiliCookie() string {
+	if c.Platform.Bilibili.Cookie != "" {
+		return c.Platform.Bilibili.Cookie
+	}
+	return c.Cookie
+}
+
 // applyDefaults fills in zero-value fields with default values.
 func applyDefaults(cfg *Config) {
-	if cfg.MaxSearchPage == 0 {
-		cfg.MaxSearchPage = DefaultMaxSearchPage
+	if cfg.MaxSearchVideos == 0 {
+		cfg.MaxSearchVideos = DefaultMaxSearchVideos
 	}
 	if cfg.MaxVideoPerAuthor == 0 {
 		cfg.MaxVideoPerAuthor = DefaultMaxVideoPerAuthor
@@ -103,9 +172,6 @@ func applyDefaults(cfg *Config) {
 	if cfg.Browser.UserDataDir == "" {
 		cfg.Browser.UserDataDir = DefaultBrowserUserDataDir
 	}
-	// Note: cfg.Browser.Headless uses *bool pointer.
-	// nil means "not set" → defaults to true via IsHeadless() method.
-	// Explicit false in YAML will be preserved.
 	if cfg.MaxConsecutiveFailures == 0 {
 		cfg.MaxConsecutiveFailures = DefaultMaxConsecutiveFailures
 	}
@@ -118,11 +184,18 @@ func applyDefaults(cfg *Config) {
 }
 
 // clampValues ensures configuration values are within valid ranges.
-// Out-of-range values are clamped to the nearest boundary with a WARN log.
 func clampValues(cfg *Config) {
-	cfg.MaxSearchPage = clampInt("max_search_page", cfg.MaxSearchPage, MinMaxSearchPage, MaxMaxSearchPage)
+	cfg.MaxSearchVideos = clampInt("max_search_videos", cfg.MaxSearchVideos, MinMaxSearchVideos, MaxMaxSearchVideos)
 	cfg.MaxVideoPerAuthor = clampInt("max_video_per_author", cfg.MaxVideoPerAuthor, MinMaxVideoPerAuthor, MaxMaxVideoPerAuthor)
 	cfg.Concurrency = clampInt("concurrency", cfg.Concurrency, MinConcurrency, MaxConcurrency)
+
+	// Clamp per-platform concurrency if set.
+	if cfg.Platform.Bilibili.Concurrency > 0 {
+		cfg.Platform.Bilibili.Concurrency = clampInt("platform.bilibili.concurrency", cfg.Platform.Bilibili.Concurrency, MinConcurrency, MaxConcurrency)
+	}
+	if cfg.Platform.YouTube.Concurrency > 0 {
+		cfg.Platform.YouTube.Concurrency = clampInt("platform.youtube.concurrency", cfg.Platform.YouTube.Concurrency, MinConcurrency, MaxConcurrency)
+	}
 }
 
 // clampInt clamps an integer value to [min, max] and logs a warning if clamped.

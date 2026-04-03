@@ -18,14 +18,39 @@ import (
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/config"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/export"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/platform/bilibili"
+	"github.com/dylanyuanZ/fast_web_meta_crawler/src/platform/youtube"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/pool"
 	"github.com/dylanyuanZ/fast_web_meta_crawler/src/progress"
-	"github.com/dylanyuanZ/fast_web_meta_crawler/src/stats"
 )
+
+// supportedPlatforms lists all supported platform names.
+var supportedPlatforms = map[string]bool{
+	"bilibili": true,
+	"youtube":  true,
+}
+
+// platformConfig holds platform-specific factory functions and settings.
+type platformConfig struct {
+	searchRecorder src.SearchRecorder
+	authorCrawler  src.AuthorCrawler
+
+	// CSV headers.
+	videoHeader       []string
+	authorBasicHeader []string
+	authorFullHeader  []string
+
+	// CSV column indices for extracting author info from video CSV.
+	videoAuthorNameCol int
+	videoAuthorIDCol   int
+
+	// Stage 2 merge function (nil if Stage 2 is not supported).
+	mergeAuthorRow   func(basicRow []string, videoRows [][]string) []string
+	isRetryableError func(err error) bool
+}
 
 func main() {
 	// Parse command-line arguments.
-	platform := flag.String("platform", "", "Target platform (e.g. bilibili)")
+	platform := flag.String("platform", "", "Target platform (e.g. bilibili, youtube)")
 	keyword := flag.String("keyword", "", "Search keyword")
 	stage := flag.String("stage", "all", "Stage to run: 0, 1, 2, or all")
 	configPath := flag.String("config", "conf/config.yaml", "Path to config file")
@@ -44,8 +69,8 @@ func main() {
 	}
 	defer applog.Close()
 
-	if *platform != "bilibili" {
-		log.Fatalf("FATAL: unsupported platform: %s (only 'bilibili' is supported)", *platform)
+	if !supportedPlatforms[*platform] {
+		log.Fatalf("FATAL: unsupported platform: %s (supported: bilibili, youtube)", *platform)
 	}
 
 	if *stage != "0" && *stage != "1" && *stage != "2" && *stage != "all" {
@@ -59,7 +84,7 @@ func main() {
 	cfg := config.Get()
 
 	log.Printf("INFO: Configuration loaded: platform=%s, keyword=%q, stage=%s, concurrency=%d, output=%s",
-		*platform, *keyword, *stage, cfg.Concurrency, cfg.OutputDir)
+		*platform, *keyword, *stage, cfg.GetPlatformConcurrency(*platform), cfg.OutputDir)
 
 	// Setup context with signal handling for graceful shutdown.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -78,7 +103,7 @@ func main() {
 	mgr, err := browser.New(browser.Config{
 		Headless:    cfg.Browser.IsHeadless(),
 		UserDataDir: cfg.Browser.UserDataDir,
-		Concurrency: cfg.Concurrency,
+		Concurrency: cfg.GetPlatformConcurrency(*platform),
 		BrowserBin:  cfg.Browser.Bin,
 	})
 	if err != nil {
@@ -94,12 +119,12 @@ func main() {
 		cancel()
 	}()
 
-	// Ensure login state.
-	loginCtx, loginCancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer loginCancel()
+	// Platform-specific initialization.
+	platCfg := buildPlatformConfig(*platform, mgr, cfg)
 
-	if err := browser.EnsureLogin(loginCtx, mgr, "https://www.bilibili.com", cfg.Cookie, bilibili.BilibiliLoginChecker); err != nil {
-		log.Fatalf("FATAL: failed to ensure login: %v", err)
+	// Ensure login state (platform-specific).
+	if err := ensurePlatformLogin(ctx, *platform, mgr, cfg); err != nil {
+		log.Fatalf("FATAL: %v", err)
 	}
 
 	// Check for existing progress file.
@@ -121,18 +146,6 @@ func main() {
 		prog = progress.NewProgress(*platform, *keyword)
 	}
 
-	// Create platform-specific crawlers.
-	searchCrawler := bilibili.NewSearchCrawler(mgr)
-	authorCrawler := bilibili.NewAuthorCrawler(mgr)
-	// Set pagination interval to match requestInterval so pagination clicks
-	// are rate-limited the same as inter-author requests. This prevents
-	// rapid pagination from triggering 412 rate limiting.
-	authorCrawler.SetPaginationInterval(cfg.RequestInterval)
-
-	// Create platform-specific CSV adapters.
-	authorAdapter := &bilibili.BilibiliAuthorCSVAdapter{}
-	videoAdapter := &bilibili.BilibiliVideoCSVAdapter{}
-
 	taskStart := time.Now()
 	var mids []src.AuthorMid
 
@@ -142,7 +155,6 @@ func main() {
 	runStage2 := *stage == "2" || *stage == "all"
 
 	if runStage0 && (prog.Stage == 0 || *stage == "0") {
-		// Determine if resuming with existing video CSV.
 		var existingVideoCSVPath string
 		if prog.VideoCSVPath != "" && len(prog.SearchPages) > 0 {
 			existingVideoCSVPath = prog.VideoCSVPath
@@ -150,41 +162,35 @@ func main() {
 		}
 
 		stage0Cfg := src.Stage0Config{
-			Platform:               *platform,
-			OutputDir:              cfg.OutputDir,
-			MaxSearchPage:          cfg.MaxSearchPage,
-			Concurrency:            cfg.Concurrency,
-			MaxConsecutiveFailures: cfg.MaxConsecutiveFailures,
-			RequestInterval:        cfg.RequestInterval,
-			Progress:               prog,
-			PoolRun:                adaptPoolRun[int, []src.Video],
-			NewVideoCSVWriter: func(outputDir, platform, keyword string) (src.VideoCSVRowWriter, error) {
-				return export.NewVideoCSVWriter(outputDir, platform, keyword,
-					videoAdapter.Header(), videoAdapter.Row)
+			Platform:  *platform,
+			OutputDir: cfg.OutputDir,
+			Progress:  prog,
+			NewCSVWriter: func(outputDir, plat, kw string) (src.CSVRowWriter, error) {
+				return export.NewCSVWriter(outputDir, plat, kw, "videos", platCfg.videoHeader)
 			},
-			OpenVideoCSVWriter: func(existingPath string) (src.VideoCSVRowWriter, error) {
-				return export.OpenVideoCSVWriter(existingPath, videoAdapter.Row)
+			OpenCSVWriter: func(existingPath string) (src.CSVRowWriter, error) {
+				return export.OpenCSVWriter(existingPath)
 			},
-			ReadVideoCSV:         export.ReadVideoCSV,
+			ReadVideoCSVAuthors: func(csvPath string) ([]src.AuthorMid, error) {
+				return export.ReadVideoCSVAuthors(csvPath, platCfg.videoAuthorNameCol, platCfg.videoAuthorIDCol)
+			},
 			ExistingVideoCSVPath: existingVideoCSVPath,
 		}
 
 		var err error
-		mids, err = src.RunStage0(ctx, searchCrawler, *keyword, stage0Cfg)
+		mids, err = src.RunStage0(ctx, platCfg.searchRecorder, *keyword, stage0Cfg)
 		if err != nil {
 			log.Fatalf("FATAL: Stage 0 failed: %v", err)
 		}
 	}
 
 	if runStage1 || runStage2 {
-		// If not coming from stage 0, load mids from intermediate data or progress file.
 		var existingCSVPath string
 		if !runStage0 || mids == nil {
 			if prog.Stage >= 1 && len(prog.AuthorMids) > 0 {
 				mids = prog.AuthorMids
 				log.Printf("INFO: Loaded %d authors from progress file", len(mids))
 
-				// Resume: filter out already completed authors using CSV.
 				if prog.AuthorCSVPath != "" {
 					existingCSVPath = prog.AuthorCSVPath
 					completedIDs, err := export.ReadCompletedAuthors(prog.AuthorCSVPath)
@@ -219,58 +225,45 @@ func main() {
 		}
 
 		if runStage1 && !runStage2 {
-			// Stage 1 only: basic author info, no video traversal.
 			stage1Cfg := src.Stage1Config{
-				Platform:               *platform,
-				Keyword:                *keyword,
-				OutputDir:              cfg.OutputDir,
-				Concurrency:            cfg.Concurrency,
-				MaxConsecutiveFailures: cfg.MaxConsecutiveFailures,
-				RequestInterval:        cfg.RequestInterval,
-				Progress:               prog,
-				PoolRun:                adaptPoolRun[src.AuthorMid, src.Author],
-				NewAuthorCSVWriter: func(outputDir, platform, keyword string) (src.AuthorCSVRowWriter, error) {
-					return export.NewAuthorCSVWriter(outputDir, platform, keyword,
-						authorAdapter.BasicHeader(), authorAdapter.BasicRow)
+				Platform:  *platform,
+				Keyword:   *keyword,
+				OutputDir: cfg.OutputDir,
+				Progress:  prog,
+				PoolRun:   adaptPoolRun[src.AuthorMid, []string],
+				NewCSVWriter: func(outputDir, plat, kw string) (src.CSVRowWriter, error) {
+					return export.NewCSVWriter(outputDir, plat, kw, "authors", platCfg.authorBasicHeader)
 				},
-				OpenAuthorCSVWriter: func(existingPath string) (src.AuthorCSVRowWriter, error) {
-					return export.OpenAuthorCSVWriter(existingPath, authorAdapter.BasicRow)
+				OpenCSVWriter: func(existingPath string) (src.CSVRowWriter, error) {
+					return export.OpenCSVWriter(existingPath)
 				},
 				ExistingCSVPath: existingCSVPath,
 			}
 
-			if err := src.RunStage1(ctx, authorCrawler, mids, stage1Cfg); err != nil {
+			if err := src.RunStage1(ctx, platCfg.authorCrawler, mids, stage1Cfg); err != nil {
 				log.Fatalf("FATAL: Stage 1 failed: %v", err)
 			}
 		}
 
 		if runStage2 {
-			// Stage 2: full author info with video traversal.
 			stage2Cfg := src.Stage2Config{
-				Platform:               *platform,
-				Keyword:                *keyword,
-				OutputDir:              cfg.OutputDir,
-				Concurrency:            cfg.Concurrency,
-				MaxVideoPerAuthor:      cfg.MaxVideoPerAuthor,
-				MaxConsecutiveFailures: cfg.MaxConsecutiveFailures,
-				RequestInterval:        cfg.RequestInterval,
-				Progress:               prog,
-				PoolRun:                adaptPoolRun[src.AuthorMid, src.Author],
-				NewAuthorCSVWriter: func(outputDir, platform, keyword string) (src.AuthorCSVRowWriter, error) {
-					return export.NewAuthorCSVWriter(outputDir, platform, keyword,
-						authorAdapter.FullHeader(), authorAdapter.FullRow)
+				Platform:  *platform,
+				Keyword:   *keyword,
+				OutputDir: cfg.OutputDir,
+				Progress:  prog,
+				PoolRun:   adaptPoolRun[src.AuthorMid, []string],
+				NewCSVWriter: func(outputDir, plat, kw string) (src.CSVRowWriter, error) {
+					return export.NewCSVWriter(outputDir, plat, kw, "authors", platCfg.authorFullHeader)
 				},
-				OpenAuthorCSVWriter: func(existingPath string) (src.AuthorCSVRowWriter, error) {
-					return export.OpenAuthorCSVWriter(existingPath, authorAdapter.FullRow)
+				OpenCSVWriter: func(existingPath string) (src.CSVRowWriter, error) {
+					return export.OpenCSVWriter(existingPath)
 				},
-				ExistingCSVPath: existingCSVPath,
-				CalcAuthorStats: func(videos []src.VideoDetail, topN int) (src.AuthorStats, []src.TopVideo) {
-					return stats.CalcAuthorStats(videos, topN, bilibili.VideoURLPrefix)
-				},
-				IsRetryableError: bilibili.IsRetryableError,
+				ExistingCSVPath:  existingCSVPath,
+				MergeAuthorRow:   platCfg.mergeAuthorRow,
+				IsRetryableError: platCfg.isRetryableError,
 			}
 
-			if err := src.RunStage2(ctx, authorCrawler, mids, stage2Cfg); err != nil {
+			if err := src.RunStage2(ctx, platCfg.authorCrawler, mids, stage2Cfg); err != nil {
 				log.Fatalf("FATAL: Stage 2 failed: %v", err)
 			}
 		}
@@ -284,8 +277,63 @@ func main() {
 	log.Printf("INFO: ========== Task completed in %v ==========", time.Since(taskStart).Round(time.Second))
 }
 
+// buildPlatformConfig creates platform-specific crawlers and configuration.
+func buildPlatformConfig(platform string, mgr *browser.Manager, cfg *config.Config) platformConfig {
+	switch platform {
+	case "bilibili":
+		sc := bilibili.NewSearchCrawler(mgr)
+		ac := bilibili.NewAuthorCrawler(mgr)
+		ac.SetPaginationInterval(cfg.GetPlatformRequestInterval(platform))
+		return platformConfig{
+			searchRecorder:     sc,
+			authorCrawler:      ac,
+			videoHeader:        bilibili.VideoHeader(),
+			authorBasicHeader:  bilibili.AuthorBasicHeader(),
+			authorFullHeader:   bilibili.AuthorFullHeader(),
+			videoAuthorNameCol: bilibili.VideoAuthorNameCol,
+			videoAuthorIDCol:   bilibili.VideoAuthorIDCol,
+			mergeAuthorRow:     bilibili.MergeAuthorRow,
+			isRetryableError:   bilibili.IsRetryableError,
+		}
+	case "youtube":
+		sc := youtube.NewSearchRecorder(mgr)
+		ac := youtube.NewAuthorCrawler(mgr)
+		return platformConfig{
+			searchRecorder:     sc,
+			authorCrawler:      ac,
+			videoHeader:        youtube.VideoHeader(),
+			authorBasicHeader:  youtube.AuthorHeader(),
+			authorFullHeader:   youtube.AuthorHeader(), // YouTube has no Stage 2 distinction
+			videoAuthorNameCol: youtube.VideoAuthorNameCol,
+			videoAuthorIDCol:   youtube.VideoAuthorIDCol,
+			mergeAuthorRow:     nil, // YouTube Stage 2 is a no-op
+			isRetryableError:   nil,
+		}
+	default:
+		log.Fatalf("FATAL: unsupported platform: %s", platform)
+		return platformConfig{} // unreachable
+	}
+}
+
+// ensurePlatformLogin handles platform-specific login requirements.
+func ensurePlatformLogin(ctx context.Context, platform string, mgr *browser.Manager, cfg *config.Config) error {
+	loginCtx, loginCancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer loginCancel()
+
+	switch platform {
+	case "bilibili":
+		cookie := cfg.GetBilibiliCookie()
+		if err := browser.EnsureLogin(loginCtx, mgr, "https://www.bilibili.com", cookie, bilibili.BilibiliLoginChecker); err != nil {
+			return fmt.Errorf("failed to ensure bilibili login: %w", err)
+		}
+	case "youtube":
+		// YouTube does not require login — no cookie needed.
+		log.Printf("INFO: [youtube] No login required, skipping login check")
+	}
+	return nil
+}
+
 // adaptPoolRun adapts pool.Run to the PoolRunFunc signature used by crawler.go.
-// This bridges the pool package types with the src package types to avoid circular imports.
 func adaptPoolRun[T any, R any](
 	ctx context.Context,
 	concurrency int,

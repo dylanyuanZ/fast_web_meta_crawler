@@ -199,21 +199,25 @@ func TestProbeStage1Quick(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchAuthorInfo failed: %v", err)
 	}
-	t.Logf("Author info: name=%s, followers=%d", info.Name, info.Followers)
+	if len(info) > 0 {
+		t.Logf("Author info: name=%s", info[0])
+	}
 
 	// Test FetchAllAuthorVideos.
 	t.Logf("=== Testing FetchAllAuthorVideos for mid=%s ===", mid)
-	videos, pageInfo, err := ac.FetchAllAuthorVideos(ctx, mid, 100)
+	videos, err := ac.FetchAllAuthorVideos(ctx, mid, 100)
 	if err != nil {
 		t.Fatalf("FetchAllAuthorVideos failed: %v", err)
 	}
-	t.Logf("Videos: count=%d, totalPages=%d, totalCount=%d", len(videos), pageInfo.TotalPages, pageInfo.TotalCount)
+	t.Logf("Videos: count=%d", len(videos))
 	for i, v := range videos {
 		if i >= 5 {
 			t.Logf("  ... and %d more", len(videos)-5)
 			break
 		}
-		t.Logf("  [%d] %s (bvid=%s, play=%d, comments=%d)", i, v.Title, v.BvID, v.PlayCount, v.CommentCount)
+		if len(v) > 0 {
+			t.Logf("  [%d] %s", i, v[0])
+		}
 	}
 }
 
@@ -269,18 +273,20 @@ func TestStage1EndToEnd(t *testing.T) {
 			t.Errorf("FetchAuthorInfo failed for %s: %v", mid.name, err)
 			continue
 		}
-		t.Logf("Author: name=%s, followers=%d", info.Name, info.Followers)
+		if len(info) > 0 {
+			t.Logf("Author: name=%s", info[0])
+		}
 
 		// FetchAllAuthorVideos
-		videos, pageInfo, err := ac.FetchAllAuthorVideos(ctx, mid.id, 100)
+		videos, err := ac.FetchAllAuthorVideos(ctx, mid.id, 100)
 		if err != nil {
 			t.Errorf("FetchAllAuthorVideos failed for %s: %v", mid.name, err)
 			continue
 		}
-		t.Logf("Videos: count=%d, totalPages=%d, totalCount=%d", len(videos), pageInfo.TotalPages, pageInfo.TotalCount)
+		t.Logf("Videos: count=%d", len(videos))
 
-		if len(videos) > 0 {
-			t.Logf("  First video: %s (bvid=%s, play=%d)", videos[0].Title, videos[0].BvID, videos[0].PlayCount)
+		if len(videos) > 0 && len(videos[0]) > 0 {
+			t.Logf("  First video: %s", videos[0][0])
 		}
 	}
 }
@@ -318,26 +324,27 @@ func TestVerifyPagination(t *testing.T) {
 	mid := "314216" // 随義のfreely, 350 videos, 9 pages
 
 	// Fetch all videos with a reasonable cap.
-	videos, pageInfo, err := ac.FetchAllAuthorVideos(ctx, mid, 200)
+	videos, err := ac.FetchAllAuthorVideos(ctx, mid, 200)
 	if err != nil {
 		t.Fatalf("FetchAllAuthorVideos: %v", err)
 	}
-	t.Logf("Total videos fetched: %d, totalPages=%d, totalCount=%d", len(videos), pageInfo.TotalPages, pageInfo.TotalCount)
+	t.Logf("Total videos fetched: %d", len(videos))
 
 	// Verify we got more than one page worth of data.
 	if len(videos) <= 30 {
 		t.Errorf("Expected more than 30 videos (multiple pages), got %d", len(videos))
 	}
 
-	// Verify no duplicate BvIDs.
+	// Verify no duplicate rows.
 	seen := make(map[string]bool)
 	for _, v := range videos {
-		if seen[v.BvID] {
-			t.Errorf("Duplicate BvID found: %s", v.BvID)
+		key := strings.Join(v, "|")
+		if seen[key] {
+			t.Errorf("Duplicate row found")
 		}
-		seen[v.BvID] = true
+		seen[key] = true
 	}
-	t.Logf("All %d videos have unique BvIDs ✓", len(videos))
+	t.Logf("All %d videos have unique rows ✓", len(videos))
 }
 
 // TestProbeSearchHashKeyword probes the difference between searching with "#keyword"
